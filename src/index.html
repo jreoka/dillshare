@@ -2709,12 +2709,14 @@
         }
 
         // Fully decrypt a (possibly chunked) file into a single ArrayBuffer.
-        // Used by the in-browser preview path where the whole file is needed.
-        async function decryptFileToArrayBuffer(url, key, fileMeta, onProgress) {
+        // Used by the in-browser preview path where the whole file is needed,
+        // and by the pipelined ZIP downloader to decrypt small files ahead of
+        // time (with an optional abort signal).
+        async function decryptFileToArrayBuffer(url, key, fileMeta, onProgress, signal) {
             if (fileMeta && fileMeta.chunked === true) {
                 const chunks = [];
                 let total = 0;
-                for await (const pt of streamDecryptChunkedParallel(url, key, fileMeta.size, null, onProgress)) {
+                for await (const pt of streamDecryptChunkedParallel(url, key, fileMeta.size, signal, onProgress)) {
                     chunks.push(pt);
                     total += pt.length;
                 }
@@ -2723,7 +2725,7 @@
                 for (const c of chunks) { out.set(c, o); o += c.length; }
                 return out.buffer;
             }
-            const res = await fetch(url);
+            const res = await fetch(url, { signal });
             if (!res.ok) throw new Error('File retrieval failed');
             const ab = await res.arrayBuffer();
             if (onProgress) onProgress({ bytesReceived: ab.byteLength, bytesDecrypted: 0, totalBytes: ab.byteLength });
@@ -3659,10 +3661,17 @@
                         const chunkSize = ENCRYPT_CHUNK_SIZE; // 4MB
                         const totalPlainChunks = Math.max(1, Math.ceil(file.size / chunkSize));
                         // Adaptive S3 part size: bigger parts = fewer round-trips on
-                        // fast links. 16MB (4 chunks) for large files keeps us well
-                        // above S3's 5MB minimum and halves the request count vs the
-                        // old fixed 8MB parts; small files still use 2 chunks (8MB).
-                        const CHUNKS_PER_PART = file.size >= (64 * 1024 * 1024) ? 4 : 2;
+                        // fast links. 16MB (4 chunks) for medium files and 32MB
+                        // (8 chunks) for large files keeps us well above S3's 5MB
+                        // minimum and slashes the request count vs the old fixed
+                        // 8MB parts; small files still use 2 chunks (8MB).
+                        let CHUNKS_PER_PART = file.size >= (256 * 1024 * 1024) ? 8 : (file.size >= (64 * 1024 * 1024) ? 4 : 2);
+                        // S3 caps multipart uploads at 10,000 parts. For gigantic
+                        // files, grow the part size so the upload always fits.
+                        const S3_MAX_PARTS = 10000;
+                        const SAFE_MAX_PARTS = 9000;
+                        const minChunksPerPart = Math.ceil(totalPlainChunks / SAFE_MAX_PARTS);
+                        if (CHUNKS_PER_PART < minChunksPerPart) CHUNKS_PER_PART = minChunksPerPart;
                         const totalParts = Math.ceil(totalPlainChunks / CHUNKS_PER_PART);
 
                         const completedParts = new Array(totalParts);
@@ -3773,13 +3782,15 @@
                                 try {
                                     const resData = await uploadBinaryBody(partUrl, partBlob, 'application/octet-stream', token, (loaded, total) => {
                                         partLoadedBytes[pIdx] = loaded;
-                                        fileLoadedBytes[i] = partLoadedBytes.reduce((a, b) => a + b, 0);
-                                        fileTotalBytes[i] = partTotalBytes.reduce((a, b) => a + b, 0);
+                                        // Parts not yet encrypted have no entry yet; treat as 0
+                                        // so the totals never go NaN.
+                                        fileLoadedBytes[i] = partLoadedBytes.reduce((a, b) => a + (b || 0), 0);
+                                        fileTotalBytes[i] = partTotalBytes.reduce((a, b) => a + (b || 0), 0);
                                         updateUploadProgressUI();
                                     });
 
                                     partLoadedBytes[pIdx] = partBlob.size;
-                                    fileLoadedBytes[i] = partLoadedBytes.reduce((a, b) => a + b, 0);
+                                    fileLoadedBytes[i] = partLoadedBytes.reduce((a, b) => a + (b || 0), 0);
                                     updateUploadProgressUI();
 
                                     completedParts[pIdx] = {
@@ -4949,34 +4960,57 @@
                     }
                 };
 
-                // Pipelined network fetching: prefetch upcoming files in parallel to eliminate network idle gaps.
-                const PREFETCH_DEPTH = 3;
-                const prefetchedStreams = new Map();
+                // --- Pipelined parallel download ---
+                // Small files (<= 16MB) are fetched AND decrypted ahead of
+                // time, several in parallel, so shares containing many files
+                // keep the user's link saturated instead of dribbling one
+                // file at a time (the old code went one file -> one request ->
+                // one round trip). Big files stream inline via the
+                // multi-connection parallel range downloader, which saturates
+                // the link on its own. Buffered plaintext is bounded, so
+                // memory stays flat regardless of share size.
+                const PREPARE_BYTE_LIMIT = 16 * 1024 * 1024; // files <= this get prepared ahead
+                const MAX_PREPARED_BYTES = 64 * 1024 * 1024; // cap on buffered plaintext
+                const MAX_PREPARED_FILES = 6;                // cap on concurrent prepared files
+                const prepared = new Map(); // index -> { promise, ac, size }
 
-                function triggerPrefetch(index) {
-                    if (index >= totalFiles || prefetchedStreams.has(index)) return;
+                function prepareFile(index) {
+                    if (prepared.has(index)) return;
                     const f = currentShareData.files[index];
-                    if (f && f.chunked) return; // Chunked files use multi-threaded parallel range requests on-demand
+                    if (!f || (typeof f.size === 'number' && f.size > PREPARE_BYTE_LIMIT)) return;
                     const url = `/api/share/${currentShareUUID}/file/file_${f.id}.enc`;
                     const ac = new AbortController();
-                    const promise = (async () => {
-                        const res = await fetch(url, { signal: ac.signal });
-                        if (!res.ok) throw new Error(`Failed to fetch file: ${f.name}`);
-                        return { res, ac };
-                    })();
-                    prefetchedStreams.set(index, promise);
+                    const promise = decryptFileToArrayBuffer(url, key, f, null, ac.signal);
+                    prepared.set(index, {
+                        promise,
+                        ac,
+                        size: (typeof f.size === 'number') ? f.size : 0
+                    });
                 }
 
-                for (let k = 0; k < Math.min(PREFETCH_DEPTH, totalFiles); k++) {
-                    triggerPrefetch(k);
-                }
-
-                // Process each file: prefetch â†’ stream-decrypt â†’ push chunks into
-                // fflate ZipPassThrough entry â†’ ZIP output flows to disk sink.
-                for (let i = 0; i < totalFiles; i++) {
-                    for (let k = i + 1; k <= i + PREFETCH_DEPTH && k < totalFiles; k++) {
-                        triggerPrefetch(k);
+                function maintainPrepareWindow(fromIndex) {
+                    let pendingBytes = 0;
+                    for (const p of prepared.values()) pendingBytes += p.size || 0;
+                    for (let k = fromIndex; k < totalFiles; k++) {
+                        const f = currentShareData.files[k];
+                        if (!f) continue;
+                        const sz = (typeof f.size === 'number' && f.size > 0) ? f.size : 0;
+                        if (sz > PREPARE_BYTE_LIMIT) continue;
+                        if (prepared.has(k)) continue;
+                        if (pendingBytes + sz > MAX_PREPARED_BYTES || prepared.size >= MAX_PREPARED_FILES) break;
+                        prepareFile(k);
+                        pendingBytes += sz;
                     }
+                }
+
+                // Prime the pipeline so downloads start immediately.
+                maintainPrepareWindow(0);
+
+                // Process each file in order: take it from the prepared buffer
+                // if small, or stream it inline if large. ZIP entries are
+                // written strictly in share order regardless.
+                for (let i = 0; i < totalFiles; i++) {
+                    maintainPrepareWindow(i + 1);
 
                     const file = currentShareData.files[i];
                     const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
@@ -4989,49 +5023,43 @@
 
                     const isChunked = file && file.chunked === true;
                     let fileWritten = 0;
-                    let ac = null;
-                    let res = null;
                     const fileAc = new AbortController();
 
-                    if (!isChunked) {
-                        const prefetchPromise = prefetchedStreams.get(i);
-                        prefetchedStreams.delete(i);
-                        if (prefetchPromise) {
-                            const fetched = await prefetchPromise;
-                            res = fetched.res;
-                            ac = fetched.ac;
-                        }
-                    }
-
                     try {
-                        if (isChunked) {
+                        const prep = prepared.get(i);
+                        const streamInline = isChunked && filePlainSize > PREPARE_BYTE_LIMIT;
+                        if (prep) {
+                            prepared.delete(i);
+                            const pt = new Uint8Array(await prep.promise);
+                            entry.push(pt, false);
+                            fileWritten += pt.length;
+                            await writeChain;
+                            if (zipErr) throw zipErr;
+                        } else if (streamInline) {
                             for await (const pt of streamDecryptChunkedParallel(fileUrl, key, filePlainSize, fileAc.signal)) {
                                 entry.push(pt, false);
                                 fileWritten += pt.length;
                                 await writeChain;
                                 if (zipErr) throw zipErr;
-                                if (totalPlainSize > 0) {
-                                    const overall = Math.min(100, Math.round(((processedPlainSize + fileWritten) / totalPlainSize) * 100));
-                                    renderOverall(i, overall);
-                                }
                             }
                         } else {
-                            const ab = await res.arrayBuffer();
-                            const pt = new Uint8Array(await decryptData(ab, key));
+                            // Legacy non-chunked file that escaped the window:
+                            // fetch and decrypt it directly.
+                            const pt = new Uint8Array(await decryptFileToArrayBuffer(fileUrl, key, file, null, fileAc.signal));
                             entry.push(pt, false);
                             fileWritten += pt.length;
                             await writeChain;
                             if (zipErr) throw zipErr;
-                            if (totalPlainSize > 0) {
-                                const overall = Math.min(100, Math.round(((processedPlainSize + fileWritten) / totalPlainSize) * 100));
-                                renderOverall(i, overall);
-                            }
+                        }
+                        if (totalPlainSize > 0) {
+                            const overall = Math.min(100, Math.round(((processedPlainSize + fileWritten) / totalPlainSize) * 100));
+                            renderOverall(i, overall);
                         }
                     } catch (e) {
-                        for (const p of prefetchedStreams.values()) {
-                            p.then(s => s.ac.abort()).catch(() => {});
+                        for (const p of prepared.values()) {
+                            try { p.ac.abort(); } catch (_) {}
                         }
-                        if (ac) ac.abort();
+                        prepared.clear();
                         fileAc.abort();
                         if (sink) { try { await sink.abort(); } catch (_) {} }
                         throw e;

@@ -231,11 +231,21 @@ async function handleStream(request, streamPath) {
     let isRange = false;
     if (rangeHeader && rangeHeader.startsWith('bytes=')) {
         const spec = rangeHeader.slice(6).split(',')[0].trim();
-        const m = /^(\d+)-(\d*)$/.exec(spec);
-        if (m) {
-            start = parseInt(m[1], 10);
-            if (m[2] !== '') {
-                end = parseInt(m[2], 10) + 1; // inclusive->exclusive
+        // Support byte ranges, open-ended ranges and suffix ranges
+        // (e.g. "bytes=0-99", "bytes=100-", "bytes=-500").
+        const suffix = /^-(\d+)$/.exec(spec);
+        const full = /^(\d+)-(\d*)$/.exec(spec);
+        if (suffix) {
+            const n = parseInt(suffix[1], 10);
+            if (n > 0) {
+                start = Math.max(0, total - n);
+                end = total;
+                isRange = true;
+            }
+        } else if (full) {
+            start = parseInt(full[1], 10);
+            if (full[2] !== '') {
+                end = parseInt(full[2], 10) + 1; // inclusive->exclusive
             } else {
                 end = total;
             }
@@ -295,6 +305,15 @@ async function getDecryptedChunk(meta, r, signal) {
     })();
 
     meta.chunkCache.set(idx, promise);
+    // Bound the cache: a long playback session would otherwise accumulate one
+    // entry per 4MB chunk forever. Evict the oldest entries when we exceed the
+    // cap; completed (non-in-flight) promises are dropped harmlessly.
+    if (meta.chunkCache.size > 48) {
+        for (const k of meta.chunkCache.keys()) {
+            if (meta.chunkCache.size <= 32) break;
+            if (k !== idx) meta.chunkCache.delete(k);
+        }
+    }
 
     try {
         return await promise;
@@ -305,6 +324,19 @@ async function getDecryptedChunk(meta, r, signal) {
 }
 
 async function respondChunkedRange(meta, start, end, isRange) {
+    // Requested range is entirely past EOF: report 416 like a real server so
+    // media players stop probing instead of waiting forever.
+    if (isRange && meta.size > 0 && start >= meta.size) {
+        return new Response(null, {
+            status: 416,
+            headers: {
+                'Accept-Ranges': 'bytes',
+                'Content-Range': `bytes */${meta.size}`,
+                'Content-Length': '0',
+                'Cache-Control': 'no-store',
+            }
+        });
+    }
     const ranges = plainRangeToCtRanges(start, end, meta.size);
     const totalLength = end - start;
     const status = isRange ? 206 : 200;
@@ -317,6 +349,12 @@ async function respondChunkedRange(meta, start, end, isRange) {
     if (isRange) {
         headers['Content-Range'] = `bytes ${start}-${end - 1}/${meta.size}`;
     }
+
+    // Zero-length request (e.g. a probe at EOF): nothing to fetch or decrypt.
+    if (totalLength <= 0 || ranges.length === 0) {
+        return new Response(null, { status, headers });
+    }
+
     console.log('[dill-sw] respondChunkedRange:', start, '-', end, 'len', totalLength, 'status', status, 'chunks', ranges.length, 'ct', meta.contentType);
 
     // Pipelined prefetch: kick off decryption of the next chunk while the

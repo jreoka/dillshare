@@ -1048,6 +1048,20 @@ async fn upload_files(
     }
 }
 
+/// Validate a client-supplied file name before it becomes part of an S3 key.
+/// Rejects path separators, traversal, hidden/system filenames and reserved
+/// internal names so uploads can never clobber share metadata objects.
+fn is_valid_upload_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.starts_with('.')
+        && name != "owner.txt"
+        && name != ".active"
+}
+
 async fn upload_files_inner(
     state: &AppState,
     username: &str,
@@ -1069,6 +1083,19 @@ async fn upload_files_inner(
 
         if file_path.trim().is_empty() {
             continue;
+        }
+
+        if !is_valid_upload_filename(&file_path) {
+            tracing::warn!(
+                "Rejecting upload with invalid file name '{:?}' for share {}",
+                file_path,
+                uuid
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Invalid file name (must not contain path separators or reserved names)"
+                    .to_string(),
+            ));
         }
 
         let content_type = mime_guess::from_path(&file_path)
@@ -1269,6 +1296,19 @@ async fn upload_chunk_or_file(
 
         if file_path.trim().is_empty() {
             continue;
+        }
+
+        if !is_valid_upload_filename(&file_path) {
+            tracing::warn!(
+                "Rejecting upload with invalid file name '{:?}' for share {}",
+                file_path,
+                uuid
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Invalid file name (must not contain path separators or reserved names)"
+                    .to_string(),
+            ));
         }
 
         let content_type = mime_guess::from_path(&file_path)
@@ -1488,6 +1528,14 @@ async fn upload_multipart_init(
         )
     })?;
 
+    if !is_valid_upload_filename(&payload.file_name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid file name (must not contain path separators or reserved names)"
+                .to_string(),
+        ));
+    }
+
     let key = format!("uploads/{}/{}", uuid, payload.file_name);
     let content_type = mime_guess::from_path(&payload.file_name)
         .first_or_octet_stream()
@@ -1528,6 +1576,20 @@ async fn upload_multipart_part(
             "Invalid or expired session".to_string(),
         )
     })?;
+
+    if !is_valid_upload_filename(&query.file_name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid file name (must not contain path separators or reserved names)"
+                .to_string(),
+        ));
+    }
+    if !(1..=10_000).contains(&query.part_number) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Part number must be between 1 and 10000".to_string(),
+        ));
+    }
 
     let key = format!("uploads/{}/{}", uuid, query.file_name);
 
@@ -1673,6 +1735,12 @@ async fn get_share(
             latest_upload_time = upload_time;
         }
 
+        // Hide internal artifacts (encrypted manifest, thumbnails) from the
+        // public file listing; viewers read the decrypted manifest instead.
+        if file_name == "metadata.enc" || file_name.ends_with(".thumb.enc") {
+            continue;
+        }
+
         files.push(ShareFile {
             name: file_name,
             size,
@@ -1731,10 +1799,22 @@ async fn download_file(
     let res = match state.storage.get_object(&state.bucket, &key, raw_range_header).await {
         Ok(output) => output,
         Err(e) => {
-            tracing::error!("S3 GetObject error: {:?}", e);
+            let (status, msg) = match &e {
+                storage::StorageError::NotFound(_) => {
+                    (StatusCode::NOT_FOUND, "File not found")
+                }
+                storage::StorageError::InvalidRange(_) => {
+                    (StatusCode::RANGE_NOT_SATISFIABLE, "Requested range not satisfiable")
+                }
+                storage::StorageError::Other(_) => {
+                    tracing::error!("S3 GetObject error: {:?}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+                }
+            };
             return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::from("File not found"))
+                .status(status)
+                .header(axum::http::header::ACCEPT_RANGES, "bytes")
+                .body(Body::from(msg))
                 .unwrap();
         }
     };
@@ -1929,7 +2009,26 @@ async fn perform_cleanup(
     let mut groups: std::collections::HashMap<String, ShareGroup> =
         std::collections::HashMap::new();
 
-    // Multipart aborted
+    // Abort abandoned S3 multipart uploads that have seen no part activity
+    // within the partial-upload timeout. These would otherwise leak storage
+    // forever (S3 keeps them until a lifecycle rule or explicit abort).
+    let partial_timeout_secs = partial_upload_limit;
+    if let Ok(multipart_uploads) = storage.list_multipart_uploads(bucket).await {
+        for mp in multipart_uploads {
+            let age = now - mp.initiated_secs;
+            if age > partial_timeout_secs {
+                tracing::info!(
+                    "Aborting stale multipart upload '{}' for key '{}' (age: {}s).",
+                    mp.upload_id,
+                    mp.key,
+                    age
+                );
+                let _ = storage
+                    .abort_multipart_upload(bucket, &mp.key, &mp.upload_id)
+                    .await;
+            }
+        }
+    }
 
     let objects = storage.list_objects(bucket, Some("uploads/"), None).await?;
     for object in objects {
@@ -2102,8 +2201,10 @@ async fn perform_cleanup(
             "Deleting {} expired/partial S3 objects...",
             keys_to_delete.len()
         );
-        for key in keys_to_delete {
-            let _ = storage.delete_object(bucket, &key).await;
+        // Batch delete in chunks of 1000 keys per request (S3's DeleteObjects
+        // limit) instead of one round trip per object.
+        for chunk in keys_to_delete.chunks(1000) {
+            let _ = storage.delete_objects_batch(bucket, chunk).await;
         }
         tracing::info!("Cleanup sweep finished successfully.");
     } else {
@@ -2835,8 +2936,12 @@ async fn delete_s3_prefix(
         .list_objects(bucket, Some(prefix), None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    for key in keys {
-        let _ = storage.delete_object(bucket, &key.key).await;
+    let key_names: Vec<String> = keys.into_iter().map(|k| k.key).collect();
+    if !key_names.is_empty() {
+        storage
+            .delete_objects_batch(bucket, &key_names)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
     Ok(())
 }

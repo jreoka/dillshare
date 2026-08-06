@@ -14,6 +14,12 @@ pub struct MemoryBackend {
     pub files: HashMap<String, Vec<u8>>,
     pub content_types: HashMap<String, String>,
     pub multipart_uploads: HashMap<String, HashMap<i32, Vec<u8>>>,
+    /// Last modification time (unix seconds) per object key. Kept so that
+    /// share expiry, upload_time reporting and cleanup work in memory mode.
+    pub last_modified: HashMap<String, i64>,
+    /// Time of last activity (unix seconds) per in-progress multipart upload,
+    /// so abandoned multipart uploads can be cleaned up in memory mode too.
+    pub multipart_upload_times: HashMap<String, i64>,
 }
 
 pub struct GetObjectOutput {
@@ -22,6 +28,25 @@ pub struct GetObjectOutput {
     pub content_length: Option<u64>,
     pub content_range: Option<String>,
 }
+
+#[derive(Debug)]
+pub enum StorageError {
+    NotFound(String),
+    InvalidRange(String),
+    Other(String),
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageError::NotFound(m) => write!(f, "Not found: {}", m),
+            StorageError::InvalidRange(m) => write!(f, "Invalid range: {}", m),
+            StorageError::Other(m) => write!(f, "{}", m),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {}
 
 #[derive(Debug, Clone)]
 pub struct ObjectInfo {
@@ -36,13 +61,70 @@ pub struct CompletedPart {
     pub part_number: i32,
 }
 
+#[derive(Debug, Clone)]
+pub struct MultipartUploadInfo {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated_secs: i64,
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse an HTTP byte-range header value ("bytes=...", first range wins) into
+/// an inclusive start / exclusive end pair clamped to `len`.
+///
+/// Returns `Err(())` when the range cannot be satisfied (start past EOF,
+/// inverted range, zero-length suffix, malformed syntax, or a range against an
+/// empty object). S3-compatible semantics.
+fn parse_byte_range(range_header: &str, len: usize) -> Result<(usize, usize), ()> {
+    let spec = range_header.strip_prefix("bytes=").ok_or(())?;
+    let spec = spec.split(',').next().unwrap_or("").trim();
+    let (start, end) = if let Some(suffix) = spec.strip_prefix('-') {
+        let n: usize = suffix.parse().map_err(|_| ())?;
+        if n == 0 {
+            return Err(());
+        }
+        let start = len.saturating_sub(n);
+        (start, len)
+    } else if let Some(idx) = spec.find('-') {
+        let start_s = &spec[..idx];
+        let end_s = &spec[idx + 1..];
+        let start: usize = if start_s.is_empty() {
+            0
+        } else {
+            start_s.parse().map_err(|_| ())?
+        };
+        if end_s.is_empty() {
+            (start, len)
+        } else {
+            let end_incl: usize = end_s.parse().map_err(|_| ())?;
+            if end_incl < start {
+                return Err(());
+            }
+            (start, end_incl.saturating_add(1))
+        }
+    } else {
+        return Err(());
+    };
+
+    if len == 0 || start >= len {
+        return Err(());
+    }
+    Ok((start, end.min(len).max(start)))
+}
+
 impl Storage {
     pub async fn get_object(
         &self,
         bucket: &str,
         key: &str,
         range_header: Option<String>,
-    ) -> Result<GetObjectOutput, String> {
+    ) -> Result<GetObjectOutput, StorageError> {
         match self {
             Storage::S3(client) => {
                 let mut req = client.get_object().bucket(bucket).key(key);
@@ -62,32 +144,53 @@ impl Storage {
                             content_range: cr,
                         })
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => match &e {
+                        aws_sdk_s3::error::SdkError::ServiceError(se) => {
+                            use aws_smithy_types::error::metadata::ProvideErrorMetadata;
+                            match se.err() {
+                                aws_sdk_s3::operation::get_object::GetObjectError::NoSuchKey(_) => {
+                                    Err(StorageError::NotFound(format!(
+                                        "Object '{}' not found in bucket '{}'",
+                                        key, bucket
+                                    )))
+                                }
+                                err => {
+                                    if err.code() == Some("InvalidRange") {
+                                        Err(StorageError::InvalidRange(e.to_string()))
+                                    } else {
+                                        Err(StorageError::Other(e.to_string()))
+                                    }
+                                }
+                            }
+                        }
+                        _ => Err(StorageError::Other(e.to_string())),
+                    },
                 }
             }
             Storage::Memory(mem) => {
                 let m = mem.lock().await;
                 if let Some(data) = m.files.get(key) {
-                    let mut start = 0;
-                    let mut end = data.len();
-                    if let Some(ref r) = range_header {
-                        if let Some(r_str) = r.strip_prefix("bytes=") {
-                            let mut parts = r_str.split('-');
-                            if let Some(s) = parts.next() {
-                                start = s.parse().unwrap_or(0);
-                            }
-                            if let Some(e) = parts.next() {
-                                if !e.is_empty() {
-                                    end = e.parse::<usize>().unwrap_or(data.len() - 1) + 1;
-                                }
+                    let (start, end) = if let Some(ref r) = range_header {
+                        match parse_byte_range(r, data.len()) {
+                            Ok(range) => range,
+                            Err(()) => {
+                                return Err(StorageError::InvalidRange(format!(
+                                    "Requested range not satisfiable for object '{}'",
+                                    key
+                                )))
                             }
                         }
-                    }
-                    let slice = data[start.min(data.len())..end.min(data.len())].to_vec();
+                    } else {
+                        (0, data.len())
+                    };
+                    let slice = data[start..end].to_vec();
                     let content_range = if range_header.is_some() {
-                        let actual_start = start.min(data.len());
-                        let actual_end = end.min(data.len()).saturating_sub(1);
-                        Some(format!("bytes {}-{}/{}", actual_start, actual_end, data.len()))
+                        Some(format!(
+                            "bytes {}-{}/{}",
+                            start,
+                            end.saturating_sub(1),
+                            data.len()
+                        ))
                     } else {
                         None
                     };
@@ -99,7 +202,10 @@ impl Storage {
                         content_range,
                     })
                 } else {
-                    Err("Not found".to_string())
+                    Err(StorageError::NotFound(format!(
+                        "Object '{}' not found in bucket '{}'",
+                        key, bucket
+                    )))
                 }
             }
         }
@@ -156,6 +262,7 @@ impl Storage {
             Storage::Memory(mem) => {
                 let mut m = mem.lock().await;
                 m.files.insert(key.to_string(), data);
+                m.last_modified.insert(key.to_string(), now_secs());
                 if let Some(ct) = content_type {
                     m.content_types.insert(key.to_string(), ct.to_string());
                 }
@@ -195,6 +302,56 @@ impl Storage {
                 let mut m = mem.lock().await;
                 m.files.remove(key);
                 m.content_types.remove(key);
+                m.last_modified.remove(key);
+                Ok(())
+            }
+        }
+    }
+
+    /// Delete many objects in one round trip. S3 supports up to 1000 keys per
+    /// DeleteObjects call, so this is dramatically faster than a per-key loop.
+    pub async fn delete_objects_batch(&self, bucket: &str, keys: &[String]) -> Result<(), String> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        match self {
+            Storage::S3(client) => {
+                for chunk in keys.chunks(1000) {
+                    let mut objects = Vec::new();
+                    for k in chunk {
+                        objects.push(
+                            aws_sdk_s3::types::ObjectIdentifier::builder()
+                                .key(k.clone())
+                                .build()
+                                .map_err(|e| format!("Failed to build ObjectIdentifier: {}", e))?,
+                        );
+                    }
+                    let delete = aws_sdk_s3::types::Delete::builder()
+                        .set_objects(Some(objects))
+                        .build()
+                        .map_err(|e| format!("Failed to build Delete request: {}", e))?;
+                    let res = client
+                        .delete_objects()
+                        .bucket(bucket)
+                        .delete(delete)
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let errors = res.errors();
+                    if !errors.is_empty() {
+                        let first = errors.first().and_then(|e| e.key()).unwrap_or("unknown");
+                        return Err(format!("S3 batch delete failed for key '{}'", first));
+                    }
+                }
+                Ok(())
+            }
+            Storage::Memory(mem) => {
+                let mut m = mem.lock().await;
+                for k in keys {
+                    m.files.remove(k);
+                    m.content_types.remove(k);
+                    m.last_modified.remove(k);
+                }
                 Ok(())
             }
         }
@@ -249,10 +406,11 @@ impl Storage {
                     keys.push(ObjectInfo {
                         key: k.clone(),
                         size: v.len() as i64,
-                        last_modified_secs: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs() as i64,
+                        last_modified_secs: m
+                            .last_modified
+                            .get(k)
+                            .copied()
+                            .unwrap_or_else(now_secs),
                     });
                     if let Some(mk) = max_keys {
                         if keys.len() as i32 >= mk {
@@ -285,6 +443,7 @@ impl Storage {
                 let upload_id = uuid::Uuid::new_v4().to_string();
                 m.multipart_uploads
                     .insert(upload_id.clone(), HashMap::new());
+                m.multipart_upload_times.insert(upload_id.clone(), now_secs());
                 Ok(upload_id)
             }
         }
@@ -298,6 +457,12 @@ impl Storage {
         part_number: i32,
         data: Vec<u8>,
     ) -> Result<String, String> {
+        if !(1..=10_000).contains(&part_number) {
+            return Err(format!(
+                "Part number {} out of range (must be 1-10000)",
+                part_number
+            ));
+        }
         match self {
             Storage::S3(client) => {
                 let res = client
@@ -316,6 +481,7 @@ impl Storage {
                 let mut m = mem.lock().await;
                 if let Some(upload) = m.multipart_uploads.get_mut(upload_id) {
                     upload.insert(part_number, data);
+                    m.multipart_upload_times.insert(upload_id.to_string(), now_secs());
                     Ok("mem-etag".to_string())
                 } else {
                     Err("Upload ID not found".to_string())
@@ -363,6 +529,8 @@ impl Storage {
                         data.extend(part_data);
                     }
                     m.files.insert(key.to_string(), data);
+                    m.last_modified.insert(key.to_string(), now_secs());
+                    m.multipart_upload_times.remove(upload_id);
                     Ok(())
                 } else {
                     Err("Upload ID not found".to_string())
@@ -371,7 +539,6 @@ impl Storage {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn abort_multipart_upload(
         &self,
         bucket: &str,
@@ -393,7 +560,65 @@ impl Storage {
             Storage::Memory(mem) => {
                 let mut m = mem.lock().await;
                 m.multipart_uploads.remove(upload_id);
+                m.multipart_upload_times.remove(upload_id);
                 Ok(())
+            }
+        }
+    }
+
+    /// List all in-progress multipart uploads in the bucket (paginated).
+    pub async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<MultipartUploadInfo>, String> {
+        match self {
+            Storage::S3(client) => {
+                let mut out = Vec::new();
+                let mut key_marker: Option<String> = None;
+                let mut upload_id_marker: Option<String> = None;
+                loop {
+                    let mut req = client.list_multipart_uploads().bucket(bucket).max_uploads(1000);
+                    if let Some(km) = &key_marker {
+                        req = req.key_marker(km.clone());
+                    }
+                    if let Some(um) = &upload_id_marker {
+                        req = req.upload_id_marker(um.clone());
+                    }
+                    let page = req.send().await.map_err(|e| e.to_string())?;
+                    for u in page.uploads() {
+                        if let (Some(k), Some(id)) = (u.key(), u.upload_id()) {
+                            out.push(MultipartUploadInfo {
+                                key: k.to_string(),
+                                upload_id: id.to_string(),
+                                initiated_secs: u.initiated().map(|d| d.secs()).unwrap_or(0),
+                            });
+                        }
+                    }
+                    if !page.is_truncated().unwrap_or(false) {
+                        break;
+                    }
+                    key_marker = page.next_key_marker().map(|s| s.to_string());
+                    upload_id_marker = page.next_upload_id_marker().map(|s| s.to_string());
+                    if key_marker.is_none() && upload_id_marker.is_none() {
+                        break;
+                    }
+                }
+                Ok(out)
+            }
+            Storage::Memory(mem) => {
+                let m = mem.lock().await;
+                Ok(m.multipart_uploads
+                    .keys()
+                    .map(|id| MultipartUploadInfo {
+                        key: String::new(),
+                        upload_id: id.clone(),
+                        initiated_secs: m
+                            .multipart_upload_times
+                            .get(id)
+                            .copied()
+                            .unwrap_or_else(now_secs),
+                    })
+                    .collect())
             }
         }
     }

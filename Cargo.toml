@@ -26,6 +26,7 @@ totp-rs = { version = "5.5", features = ["qr", "gen_secret"] }
 rand = "0.10.2"
 base64 = "0.22.1"
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
+aws-smithy-types = "1.6.1"
 
 [profile.release]
 opt-level = 3
