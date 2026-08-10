@@ -141,6 +141,8 @@ self.addEventListener('message', async (event) => {
                 ctSize: d.chunked ? ctSizeFor(d.size, true) : null,
                 contentType: d.contentType || 'application/octet-stream',
                 url: d.url,
+                authUrl: d.authUrl || null,
+                urlRefresh: null,
                 cached: null, // only used for legacy single-block format
                 chunkCache: new Map(), // Map<chunkIndex, Promise<Uint8Array>>
             };
@@ -276,6 +278,23 @@ function headHeaders(meta, total) {
     return h;
 }
 
+async function refreshUpstreamUrl(meta) {
+    if (!meta.authUrl) return meta.url;
+    if (!meta.urlRefresh) {
+        meta.urlRefresh = (async () => {
+            const response = await fetch(meta.authUrl, { cache: 'no-store' });
+            if (!response.ok) throw new Error('Download authorization failed: ' + response.status);
+            const signed = await response.json();
+            if (!signed.url) throw new Error('Download authorization returned no URL');
+            meta.url = signed.url;
+            return meta.url;
+        })().finally(() => {
+            meta.urlRefresh = null;
+        });
+    }
+    return await meta.urlRefresh;
+}
+
 async function getDecryptedChunk(meta, r, signal) {
     if (!meta.chunkCache) {
         meta.chunkCache = new Map();
@@ -294,11 +313,20 @@ async function getDecryptedChunk(meta, r, signal) {
             headers: { Range: `bytes=${r.fetchStart}-${r.fetchEnd - 1}` }
         };
         if (signal) fetchOpts.signal = signal;
-        const res = await fetch(meta.url, fetchOpts);
-        if (!res.ok && res.status !== 206) {
-            throw new Error('Upstream fetch failed: ' + res.status);
+        let res = await fetch(meta.url, fetchOpts);
+        if ((res.status === 401 || res.status === 403) && meta.authUrl) {
+            await refreshUpstreamUrl(meta);
+            res = await fetch(meta.url, fetchOpts);
+        }
+        if (res.status !== 206) {
+            throw new Error('S3 did not honor the requested byte range: ' + res.status);
         }
         const buf = new Uint8Array(await res.arrayBuffer());
+        const expectedLength = r.fetchEnd - r.fetchStart;
+        const expectedContentRange = `bytes ${r.fetchStart}-${r.fetchEnd - 1}/${meta.ctSize}`;
+        if (res.headers.get('Content-Range') !== expectedContentRange || buf.length !== expectedLength) {
+            throw new Error('S3 returned an invalid encrypted byte range');
+        }
         const iv = buf.subarray(0, 12);
         const ct = buf.subarray(12, 12 + r.ctLen);
         return await decryptChunk(iv, ct, meta.key);
@@ -421,7 +449,11 @@ async function respondChunkedRange(meta, start, end, isRange) {
 async function respondLegacyRange(meta, start, end, isRange, total) {
     // Legacy single-block format: must decrypt the whole file once, then slice.
     if (!meta.cached) {
-        const res = await fetch(meta.url);
+        let res = await fetch(meta.url);
+        if ((res.status === 401 || res.status === 403) && meta.authUrl) {
+            await refreshUpstreamUrl(meta);
+            res = await fetch(meta.url);
+        }
         if (!res.ok) throw new Error('Upstream fetch failed: ' + res.status);
         const ab = await res.arrayBuffer();
         const data = new Uint8Array(ab);

@@ -1951,6 +1951,8 @@
             const keyHex = window.location.hash.substring(1);
             const rawKeyBytes = hexToBuf(keyHex);
             if (!rawKeyBytes) throw new Error('Decryption key missing');
+            const appFileUrl = `/api/share/${currentShareUUID}/file/file_${fileMeta.id}.enc`;
+            const directUrl = await resolveDirectDownloadUrl(appFileUrl);
             return new Promise((resolve, reject) => {
                 const timer = setTimeout(() => {
                     if (pendingStreamInits.has(streamPath)) {
@@ -1971,7 +1973,8 @@
                     size: fileMeta.size,
                     chunked: !!(fileMeta && fileMeta.chunked),
                     contentType: contentType || 'application/octet-stream',
-                    url: `/api/share/${currentShareUUID}/file/file_${fileMeta.id}.enc`
+                    url: directUrl,
+                    authUrl: appFileUrl.replace('/file/', '/file-url/')
                 });
             });
         }
@@ -2409,14 +2412,45 @@
             }
         }
 
+        const directDownloadUrlCache = new Map();
+
+        async function resolveDirectDownloadUrl(url, forceRefresh = false) {
+            const parsed = new URL(url, window.location.origin);
+            if (parsed.origin !== window.location.origin || !parsed.pathname.includes('/file/')) {
+                return url;
+            }
+            if (forceRefresh) directDownloadUrlCache.delete(parsed.pathname);
+            const cached = directDownloadUrlCache.get(parsed.pathname);
+            if (cached && cached.expiresAt > Date.now()) return cached.url;
+
+            const signingPath = parsed.pathname.replace('/file/', '/file-url/');
+            const response = await fetch(signingPath, { cache: 'no-store' });
+            if (!response.ok) throw new Error(await response.text() || `Download authorization failed (${response.status})`);
+            const signed = await response.json();
+            if (!signed.url || !Number.isFinite(signed.expires_in)) {
+                throw new Error('Server returned an invalid direct-download URL');
+            }
+            const cacheSeconds = Math.max(1, signed.expires_in - 15);
+            directDownloadUrlCache.set(parsed.pathname, {
+                url: signed.url,
+                expiresAt: Date.now() + cacheSeconds * 1000
+            });
+            return signed.url;
+        }
+
         // High-performance Parallel HTTP Range downloader + Web Worker pool decryptor
         async function* streamDecryptChunkedParallel(target, key, totalPlaintextSize, signal, onProgress) {
             const chunkSize = ENCRYPT_CHUNK_SIZE;
             const totalChunks = Math.max(1, Math.ceil(totalPlaintextSize / chunkSize));
             const rawKeyBytes = await getRawKeyBytes(key);
+            const authorizationUrl = typeof target === 'string' ? target : null;
+
+            if (typeof target === 'string') {
+                target = await resolveDirectDownloadUrl(target);
+            }
 
             if (typeof target === 'string' && rawKeyBytes) {
-                const url = target;
+                let url = target;
                 const pool = getDecryptPool();
                 const promises = new Array(totalChunks);
                 const resolvers = new Array(totalChunks);
@@ -2464,15 +2498,24 @@
                                 headers: { Range: `bytes=${meta.fetchStart}-${meta.fetchEnd}` }
                             };
                             if (signal) fetchOpts.signal = signal;
-                            const res = await fetch(url, fetchOpts);
-                            if (!res.ok && res.status !== 206) {
-                                throw new Error(`Range fetch failed status ${res.status} for chunk ${chunkIdx}`);
+                            let res = await fetch(url, fetchOpts);
+                            if ((res.status === 401 || res.status === 403) && authorizationUrl && authorizationUrl !== url) {
+                                url = await resolveDirectDownloadUrl(authorizationUrl, true);
+                                res = await fetch(url, fetchOpts);
+                            }
+                            if (res.status !== 206) {
+                                throw new Error(`S3 did not honor the byte range for chunk ${chunkIdx} (status ${res.status})`);
+                            }
+                            const expectedLength = meta.fetchEnd - meta.fetchStart + 1;
+                            const expectedContentRange = `bytes ${meta.fetchStart}-${meta.fetchEnd}/${ctCursor}`;
+                            if (res.headers.get('Content-Range') !== expectedContentRange) {
+                                throw new Error('S3 returned an invalid Content-Range header. Check bucket CORS ExposeHeaders.');
                             }
                             const arrayBuf = await res.arrayBuffer();
                             if (checkAbort()) break;
                             const block = new Uint8Array(arrayBuf);
-                            if (block.length < meta.fetchEnd - meta.fetchStart + 1) {
-                                throw new Error(`Truncated range download for chunk ${chunkIdx}`);
+                            if (block.length !== expectedLength) {
+                                throw new Error(`Invalid range length for chunk ${chunkIdx}`);
                             }
                             const iv = block.subarray(0, 12);
                             const ct = block.subarray(12);
@@ -3335,72 +3378,55 @@
             }
         });
 
-        function uploadFormDataSingle(url, formData, token, onProgress) {
-            return new Promise((resolve, reject) => {
-                if (isUploadCancelled) {
-                    return reject(new Error('Upload cancelled'));
-                }
-                const xhr = new XMLHttpRequest();
-                activeUploadXhrs.push(xhr);
-                xhr.open('POST', url, true);
-                if (token) {
-                    xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-                }
-                if (onProgress) {
-                    xhr.upload.onprogress = (e) => {
-                        if (e.lengthComputable) {
-                            onProgress(e.loaded, e.total);
-                        }
-                    };
-                }
-                const cleanup = () => {
-                    const idx = activeUploadXhrs.indexOf(xhr);
-                    if (idx !== -1) activeUploadXhrs.splice(idx, 1);
-                };
-                xhr.onload = () => {
-                    cleanup();
-                    if (isUploadCancelled) {
-                        return reject(new Error('Upload cancelled'));
-                    }
-                    if (xhr.status === 200) {
-                        try {
-                            resolve(JSON.parse(xhr.responseText));
-                        } catch (e) {
-                            resolve(xhr.responseText);
-                        }
-                    } else {
-                        if (xhr.status === 401) {
-                            showToast('Your session has expired. Please sign in again.', 'info');
-                            logoutUser();
-                        }
-                        reject(new Error(xhr.responseText || `Upload failed with status ${xhr.status}`));
-                    }
-                };
-                xhr.onerror = () => {
-                    cleanup();
-                    reject(new Error(isUploadCancelled ? 'Upload cancelled' : 'Network error during upload'));
-                };
-                xhr.onabort = () => {
-                    cleanup();
-                    reject(new Error('Upload cancelled'));
-                };
-                xhr.send(formData);
+        async function requestDirectUpload(url, payload, token) {
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) headers['Authorization'] = `Bearer ${token}`;
+            const response = await fetch(url, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(payload)
             });
+            if (!response.ok) {
+                if (response.status === 401) {
+                    showToast('Your session has expired. Please sign in again.', 'info');
+                    logoutUser();
+                }
+                const error = new Error(await response.text() || `Upload authorization failed with status ${response.status}`);
+                error.status = response.status;
+                throw error;
+            }
+            return await response.json();
         }
 
-        function uploadBinaryBodySingle(url, bodyData, contentType, token, onProgress) {
+        async function sha256Base64(blob) {
+            const digest = new Uint8Array(await window.crypto.subtle.digest('SHA-256', await blob.arrayBuffer()));
+            let binary = '';
+            for (const byte of digest) binary += String.fromCharCode(byte);
+            return btoa(binary);
+        }
+
+        function uploadDirectSingle(request, bodyData, onProgress) {
             return new Promise((resolve, reject) => {
                 if (isUploadCancelled) {
                     return reject(new Error('Upload cancelled'));
                 }
+                if (request.already_uploaded) {
+                    if (onProgress) onProgress(bodyData.size, bodyData.size);
+                    return resolve({ already_uploaded: true });
+                }
+                if (!request.url || request.method !== 'PUT') {
+                    return reject(new Error('Server returned an invalid direct-upload request'));
+                }
+
                 const xhr = new XMLHttpRequest();
                 activeUploadXhrs.push(xhr);
-                xhr.open('POST', url, true);
-                if (contentType) {
-                    xhr.setRequestHeader('Content-Type', contentType);
-                }
-                if (token) {
-                    xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+                xhr.open(request.method, request.url, true);
+                for (const [name, value] of Object.entries(request.headers || {})) {
+                    const lowerName = name.toLowerCase();
+                    // Browsers set these protected headers themselves. Credentials
+                    // are deliberately never forwarded to object storage.
+                    if (lowerName === 'host' || lowerName === 'content-length' || lowerName === 'authorization' || lowerName === 'cookie') continue;
+                    xhr.setRequestHeader(name, value);
                 }
                 if (onProgress) {
                     xhr.upload.onprogress = (e) => {
@@ -3418,23 +3444,17 @@
                     if (isUploadCancelled) {
                         return reject(new Error('Upload cancelled'));
                     }
-                    if (xhr.status === 200) {
-                        try {
-                            resolve(JSON.parse(xhr.responseText));
-                        } catch (e) {
-                            resolve(xhr.responseText);
-                        }
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        resolve({ e_tag: xhr.getResponseHeader('ETag') });
                     } else {
-                        if (xhr.status === 401) {
-                            showToast('Your session has expired. Please sign in again.', 'info');
-                            logoutUser();
-                        }
-                        reject(new Error(xhr.responseText || `Upload failed with status ${xhr.status}`));
+                        const error = new Error(xhr.responseText || `S3 upload failed with status ${xhr.status}`);
+                        error.status = xhr.status;
+                        reject(error);
                     }
                 };
                 xhr.onerror = () => {
                     cleanup();
-                    reject(new Error(isUploadCancelled ? 'Upload cancelled' : 'Network error during upload'));
+                    reject(new Error(isUploadCancelled ? 'Upload cancelled' : 'Direct S3 upload failed. Check the bucket CORS configuration.'));
                 };
                 xhr.onabort = () => {
                     cleanup();
@@ -3444,13 +3464,19 @@
             });
         }
 
-        async function uploadBinaryBody(url, bodyData, contentType, token, onProgress, retries = 3) {
+        async function uploadDirectObject(uuid, fileName, bodyData, token, onProgress, retries = 3) {
+            const checksumSha256 = await sha256Base64(bodyData);
             for (let attempt = 0; attempt <= retries; attempt++) {
                 if (isUploadCancelled) throw new Error('Upload cancelled');
                 try {
-                    return await uploadBinaryBodySingle(url, bodyData, contentType, token, onProgress);
+                    const request = await requestDirectUpload(`/api/upload/${uuid}/presign`, {
+                        file_name: fileName,
+                        content_length: bodyData.size,
+                        checksum_sha256: checksumSha256
+                    }, token);
+                    return await uploadDirectSingle(request, bodyData, onProgress);
                 } catch (err) {
-                    if (isUploadCancelled || err.message === 'Upload cancelled' || err.message.includes('401') || attempt === retries) {
+                    if (isUploadCancelled || err.message === 'Upload cancelled' || err.status === 401 || (err.status >= 400 && err.status < 500 && err.status !== 409 && err.status !== 412 && err.status !== 429) || attempt === retries) {
                         throw err;
                     }
                     const delay = Math.pow(2, attempt) * 1000;
@@ -3460,13 +3486,25 @@
             }
         }
 
-        async function uploadFormData(url, formData, token, onProgress, retries = 3) {
+        async function uploadDirectPart(uuid, uploadId, fileName, partNumber, bodyData, token, onProgress, retries = 3) {
+            const checksumSha256 = await sha256Base64(bodyData);
             for (let attempt = 0; attempt <= retries; attempt++) {
                 if (isUploadCancelled) throw new Error('Upload cancelled');
                 try {
-                    return await uploadFormDataSingle(url, formData, token, onProgress);
+                    const request = await requestDirectUpload(`/api/upload/${uuid}/multipart/part-url`, {
+                        upload_id: uploadId,
+                        file_name: fileName,
+                        part_number: partNumber,
+                        content_length: bodyData.size,
+                        checksum_sha256: checksumSha256
+                    }, token);
+                    const result = await uploadDirectSingle(request, bodyData, onProgress);
+                    if (!result.e_tag) {
+                        throw new Error('S3 did not expose the ETag response header. Add ETag to the bucket CORS ExposeHeaders list.');
+                    }
+                    return { ...result, checksum_sha256: checksumSha256 };
                 } catch (err) {
-                    if (isUploadCancelled || err.message === 'Upload cancelled' || err.message.includes('401') || attempt === retries) {
+                    if (isUploadCancelled || err.message === 'Upload cancelled' || err.status === 401 || (err.status >= 400 && err.status < 500 && err.status !== 409 && err.status !== 412 && err.status !== 429) || attempt === retries) {
                         throw err;
                     }
                     const delay = Math.pow(2, attempt) * 1000;
@@ -3507,40 +3545,43 @@
 
                 // 2. Initialize upload session on server
                 if (uploadProgressTitle) uploadProgressTitle.textContent = 'Initializing Session...';
-                const initHeaders = {};
+                const initHeaders = { 'Content-Type': 'application/json' };
                 if (token) initHeaders['Authorization'] = `Bearer ${token}`;
-                
-                const initRes = await fetch('/api/upload/init', { method: 'POST', headers: initHeaders });
-                let uuid = null;
-                let isSessionUpload = false;
-                if (initRes.ok) {
-                    const initData = await initRes.json();
-                    uuid = initData.uuid;
-                    activeUploadUuid = uuid;
-                    isSessionUpload = true;
 
-                    if (activeUploadPingInterval) clearInterval(activeUploadPingInterval);
-                    activeUploadPingInterval = setInterval(() => {
-                        if (activeUploadUuid) {
-                            const token = localStorage.getItem('dill_session_token');
-                            const headers = {};
-                            if (token) headers['Authorization'] = `Bearer ${token}`;
-                            fetch(`/api/upload/${activeUploadUuid}/ping`, { method: 'POST', headers }).catch(() => {});
-                        }
-                    }, 30000);
+                const initRes = await fetch('/api/upload/init', {
+                    method: 'POST',
+                    headers: initHeaders,
+                    body: JSON.stringify({ file_sizes: selectedFiles.map(item => item.file.size) })
+                });
+                if (!initRes.ok) {
+                    if (initRes.status === 401) logoutUser();
+                    throw new Error(await initRes.text() || `Failed to initialize direct upload (${initRes.status})`);
                 }
+                const initData = await initRes.json();
+                if (!initData.uuid || initData.upload_mode !== 'direct') {
+                    throw new Error('Direct S3 uploads are not available');
+                }
+                const uuid = initData.uuid;
+                activeUploadUuid = uuid;
+
+                if (activeUploadPingInterval) clearInterval(activeUploadPingInterval);
+                activeUploadPingInterval = setInterval(() => {
+                    if (activeUploadUuid) {
+                        const token = localStorage.getItem('dill_session_token');
+                        const headers = {};
+                        if (token) headers['Authorization'] = `Bearer ${token}`;
+                        fetch(`/api/upload/${activeUploadUuid}/ping`, { method: 'POST', headers }).catch(() => {});
+                    }
+                }, 30000);
 
                 const meta = { 
                     files: [],
                     message: shareMsgVal || null,
                     owner_pfp: localStorage.getItem('dill_pfp') || null
                 };
-                let bytesEncryptedTotal = 0;
-                let encStartTime = Date.now();
-
                 if (uploadProgressTitle) uploadProgressTitle.textContent = `Encrypting ${selectedFiles.length} file(s)...`;
 
-                if (isSessionUpload && uuid) {
+                {
                     const metaFiles = new Array(selectedFiles.length);
                     let filesProcessedCount = 0;
 
@@ -3622,9 +3663,7 @@
                         };
 
                         if (hasThumb && encThumbBlob) {
-                            const thumbFormData = new FormData();
-                            thumbFormData.append('files', encThumbBlob, `file_${i}.thumb.enc`);
-                            uploadFormData(`/api/upload/${uuid}`, thumbFormData, token).catch(() => {});
+                            await uploadDirectObject(uuid, `file_${i}.thumb.enc`, encThumbBlob, token);
                         }
 
                         if (file.size <= 8 * 1024 * 1024) {
@@ -3633,9 +3672,7 @@
                             fileTotalBytes[i] = encBlob.size;
                             updateUploadProgressUI();
 
-                            const fileFormData = new FormData();
-                            fileFormData.append('files', encBlob, fileName);
-                            await uploadFormData(`/api/upload/${uuid}`, fileFormData, token, (loaded, total) => {
+                            await uploadDirectObject(uuid, fileName, encBlob, token, (loaded, total) => {
                                 fileLoadedBytes[i] = loaded;
                                 fileTotalBytes[i] = total;
                                 updateUploadProgressUI();
@@ -3668,7 +3705,6 @@
                         let CHUNKS_PER_PART = file.size >= (256 * 1024 * 1024) ? 8 : (file.size >= (64 * 1024 * 1024) ? 4 : 2);
                         // S3 caps multipart uploads at 10,000 parts. For gigantic
                         // files, grow the part size so the upload always fits.
-                        const S3_MAX_PARTS = 10000;
                         const SAFE_MAX_PARTS = 9000;
                         const minChunksPerPart = Math.ceil(totalPlainChunks / SAFE_MAX_PARTS);
                         if (CHUNKS_PER_PART < minChunksPerPart) CHUNKS_PER_PART = minChunksPerPart;
@@ -3778,9 +3814,8 @@
                                 if (!job) continue;
 
                                 const { pIdx, partNum, partBlob } = job;
-                                const partUrl = `/api/upload/${uuid}/multipart/part?upload_id=${encodeURIComponent(upload_id)}&part_number=${partNum}&file_name=${encodeURIComponent(fileName)}`;
                                 try {
-                                    const resData = await uploadBinaryBody(partUrl, partBlob, 'application/octet-stream', token, (loaded, total) => {
+                                    const resData = await uploadDirectPart(uuid, upload_id, fileName, partNum, partBlob, token, (loaded, total) => {
                                         partLoadedBytes[pIdx] = loaded;
                                         // Parts not yet encrypted have no entry yet; treat as 0
                                         // so the totals never go NaN.
@@ -3795,7 +3830,8 @@
 
                                     completedParts[pIdx] = {
                                         part_number: partNum,
-                                        e_tag: resData.e_tag
+                                        e_tag: resData.e_tag,
+                                        checksum_sha256: resData.checksum_sha256
                                     };
                                 } catch (err) {
                                     uploadError = err;
@@ -3830,19 +3866,31 @@
 
                         if (isUploadCancelled) throw new Error('Upload cancelled');
 
-                        const compRes = await fetch(`/api/upload/${uuid}/multipart/complete`, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                ...(token ? { 'Authorization': `Bearer ${token}` } : {})
-                            },
-                            body: JSON.stringify({
-                                upload_id: upload_id,
-                                file_name: fileName,
-                                parts: completedParts
-                            })
-                        });
-                        if (!compRes.ok) throw new Error(await compRes.text());
+                        for (let attempt = 0; attempt < 3; attempt++) {
+                            try {
+                                const compRes = await fetch(`/api/upload/${uuid}/multipart/complete`, {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                        ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+                                    },
+                                    body: JSON.stringify({
+                                        upload_id: upload_id,
+                                        file_name: fileName,
+                                        parts: completedParts
+                                    })
+                                });
+                                if (!compRes.ok) {
+                                    const error = new Error(await compRes.text() || `Multipart completion failed (${compRes.status})`);
+                                    error.status = compRes.status;
+                                    throw error;
+                                }
+                                break;
+                            } catch (error) {
+                                if (attempt === 2 || (error.status >= 400 && error.status < 500 && error.status !== 409 && error.status !== 429)) throw error;
+                                await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+                            }
+                        }
 
                         filesProcessedCount++;
                         updateUploadProgressUI();
@@ -3871,24 +3919,33 @@
                     const metaBuf = new TextEncoder().encode(JSON.stringify(meta));
                     const encryptedMetaBuf = await encryptData(metaBuf.buffer, key);
                     const metaBlob = new Blob([encryptedMetaBuf], { type: 'application/octet-stream' });
-
-                    const metaFormData = new FormData();
-                    metaFormData.append('files', metaBlob, 'metadata.enc');
-                    await uploadFormData(`/api/upload/${uuid}`, metaFormData, token);
+                    await uploadDirectObject(uuid, 'metadata.enc', metaBlob, token);
 
                     // Call finish endpoint
                     const finishHeaders = { 'Content-Type': 'application/json' };
                     if (token) finishHeaders['Authorization'] = `Bearer ${token}`;
-                    const finishRes = await fetch(`/api/upload/${uuid}/finish`, {
-                        method: 'POST',
-                        headers: finishHeaders,
-                        body: JSON.stringify({
-                            files_count: selectedFiles.length,
-                            total_size: totalUnencryptedSize
-                        })
-                    });
-                    if (!finishRes.ok) throw new Error(await finishRes.text());
-                    const response = await finishRes.json();
+                    let response = null;
+                    for (let attempt = 0; attempt < 3 && !response; attempt++) {
+                        try {
+                            const finishRes = await fetch(`/api/upload/${uuid}/finish`, {
+                                method: 'POST',
+                                headers: finishHeaders,
+                                body: JSON.stringify({
+                                    files_count: selectedFiles.length,
+                                    total_size: totalUnencryptedSize
+                                })
+                            });
+                            if (!finishRes.ok) {
+                                const error = new Error(await finishRes.text() || `Failed to finalize upload (${finishRes.status})`);
+                                error.status = finishRes.status;
+                                throw error;
+                            }
+                            response = await finishRes.json();
+                        } catch (error) {
+                            if (attempt === 2 || (error.status >= 400 && error.status < 500 && error.status !== 409 && error.status !== 429)) throw error;
+                            await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+                        }
+                    }
 
                     showToast('Encrypted upload complete!', 'success');
 
@@ -3921,101 +3978,6 @@
                     }
                     activeUploadUuid = null;
                     activeUploadXhrs = [];
-                    uploadProgressCard.style.display = 'none';
-                    dropZone.style.pointerEvents = 'auto';
-                    dropZone.style.opacity = '1';
-                    selectedFiles = [];
-                    if (shareMsgInput) {
-                        shareMsgInput.value = '';
-                        if (msgCharCount) msgCharCount.textContent = '0 / 4000';
-                    }
-                    displayShareResult(response.uuid, keyHex);
-
-                } else {
-                    // Fallback to legacy single POST upload
-                    const formData = new FormData();
-                    for (let i = 0; i < selectedFiles.length; i++) {
-                        const item = selectedFiles[i];
-                        const encBlob = await encryptFileChunked(item.file, key, (chunkSize) => {
-                            bytesEncryptedTotal += chunkSize;
-                            const pct = Math.round((bytesEncryptedTotal / totalUnencryptedSize) * 100);
-                            uploadProgressBar.style.width = `${Math.round(pct / 2)}%`;
-                            progressPercentage.textContent = `${pct}% (Encrypted)`;
-                        });
-
-                        let hasThumb = false;
-                        let encThumbBlob = null;
-                        try {
-                            const thumbBuf = await generateThumbnail(item.file);
-                            if (thumbBuf && thumbBuf.byteLength > 0) {
-                                const encThumbBuf = await encryptData(thumbBuf, key);
-                                encThumbBlob = new Blob([encThumbBuf], { type: 'application/octet-stream' });
-                                hasThumb = true;
-                            }
-                        } catch (e) {}
-
-                        formData.append('files', encBlob, `file_${i}.enc`);
-                        if (hasThumb && encThumbBlob) {
-                            formData.append('files', encThumbBlob, `file_${i}.thumb.enc`);
-                        }
-                        meta.files.push({
-                            id: i.toString(),
-                            name: item.relativePath,
-                            size: item.file.size,
-                            type: item.file.type || 'application/octet-stream',
-                            chunked: true,
-                            thumb: hasThumb
-                        });
-                    }
-
-                    const metaBuf = new TextEncoder().encode(JSON.stringify(meta));
-                    const encryptedMetaBuf = await encryptData(metaBuf.buffer, key);
-                    const metaBlob = new Blob([encryptedMetaBuf], { type: 'application/octet-stream' });
-                    formData.append('files', metaBlob, 'metadata.enc');
-
-                    let startTime = Date.now();
-                    const response = await uploadFormData('/api/upload', formData, token, (loaded, total) => {
-                        const percent = Math.round((loaded / total) * 100);
-                        uploadProgressBar.style.width = `${50 + Math.round(percent / 2)}%`;
-                        progressPercentage.textContent = `${percent}% (Uploaded)`;
-
-                        const elapsedTime = (Date.now() - startTime) / 1000;
-                        if (elapsedTime > 0) {
-                            const speedBytes = loaded / elapsedTime;
-                            progressSpeed.textContent = `${formatBytes(speedBytes)}/s`;
-                            const remainingBytes = total - loaded;
-                            const remainingTime = remainingBytes / speedBytes;
-                            if (remainingTime > 0) {
-                                const mins = Math.floor(remainingTime / 60);
-                                const secs = Math.floor(remainingTime % 60);
-                                progressEta.textContent = mins > 0 ? `ETA: ${mins}m ${secs}s` : `ETA: ${secs}s`;
-                            } else {
-                                progressEta.textContent = 'Finalizing upload...';
-                            }
-                        }
-                    });
-
-                    showToast('Encrypted upload complete!', 'success');
-                    const newShare = {
-                        uuid: response.uuid,
-                        key: keyHex,
-                        files_count: selectedFiles.length,
-                        total_size: totalUnencryptedSize
-                    };
-
-                    const isLoggedIn = !!localStorage.getItem('dill_session_token');
-                    if (isLoggedIn) {
-                        try {
-                            const accountShares = await fetchAccountShares();
-                            accountShares.push(newShare);
-                            await saveAccountShares(accountShares);
-                        } catch (e) {}
-                    } else {
-                        const myShares = JSON.parse(localStorage.getItem('my_shares') || '[]');
-                        myShares.push(newShare);
-                        localStorage.setItem('my_shares', JSON.stringify(myShares));
-                    }
-
                     uploadProgressCard.style.display = 'none';
                     dropZone.style.pointerEvents = 'auto';
                     dropZone.style.opacity = '1';

@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path, State},
-    http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE},
+    extract::{DefaultBodyLimit, Path, State},
+    http::header::CONTENT_TYPE,
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -68,6 +68,10 @@ struct AppState {
     bucket: String,
     jwt_secret: Vec<u8>,
     webauthn: std::sync::Arc<webauthn_rs::Webauthn>,
+    presign_ttl: std::time::Duration,
+    share_expiry_secs: i64,
+    upload_session_max_secs: i64,
+    max_share_bytes: i64,
 }
 
 #[tokio::main]
@@ -85,17 +89,17 @@ async fn main() {
         .init();
 
     // Load S3 Configuration
-    let bucket = std::env::var("AWS_S3_BUCKET")
+    let configured_bucket = std::env::var("AWS_S3_BUCKET")
         .or_else(|_| std::env::var("S3_BUCKET"))
-        .unwrap_or_else(|_| {
-            if std::env::var("AWS_ACCESS_KEY_ID").is_err()
-                || std::env::var("AWS_SECRET_ACCESS_KEY").is_err()
-            {
-                "local-testing-bucket".to_string()
-            } else {
-                panic!("AWS_S3_BUCKET or S3_BUCKET environment variable is required");
-            }
-        });
+        .ok();
+    if configured_bucket.is_none()
+        && (std::env::var("AWS_ACCESS_KEY_ID").is_ok() || std::env::var("AWS_ENDPOINT_URL").is_ok())
+    {
+        panic!("AWS_S3_BUCKET or S3_BUCKET environment variable is required");
+    }
+    let bucket = configured_bucket
+        .clone()
+        .unwrap_or_else(|| "local-testing-bucket".to_string());
 
     let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
 
@@ -114,13 +118,13 @@ async fn main() {
         }
     }
 
-    let has_aws =
-        std::env::var("AWS_ACCESS_KEY_ID").is_ok() || std::env::var("AWS_DEFAULT_REGION").is_ok();
-    let storage = if has_aws {
+    let storage = if configured_bucket.is_some() {
         let s3_client = aws_sdk_s3::Client::from_conf(s3_config_builder.build());
         storage::Storage::S3(s3_client)
     } else {
-        println!("WARNING: AWS envs not set. Running in memory testing mode.");
+        tracing::warn!(
+            "No S3 bucket configured. Running in memory mode; direct file transfers are disabled."
+        );
         storage::Storage::Memory(std::sync::Arc::new(tokio::sync::Mutex::new(
             storage::MemoryBackend::default(),
         )))
@@ -160,11 +164,36 @@ async fn main() {
     let builder = builder.rp_name("DillShare");
     let webauthn = std::sync::Arc::new(builder.build().expect("Invalid Webauthn config"));
 
+    let presign_ttl_secs = std::env::var("DILLSHARE_PRESIGN_TTL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(300)
+        .clamp(60, 900);
+    let share_expiry_days = std::env::var("DILLSHARE_EXPIRE_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(90)
+        .clamp(1, 3650);
+    let upload_session_max_hours = std::env::var("DILLSHARE_PARTIAL_TIMEOUT_HOURS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(12)
+        .clamp(1, 168);
+    let max_share_bytes = std::env::var("DILLSHARE_MAX_SHARE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(100 * 1024 * 1024 * 1024)
+        .clamp(1024 * 1024, 5 * 1024 * 1024 * 1024 * 1024);
+
     let state = AppState {
         storage: storage.clone(),
         bucket: bucket.clone(),
         jwt_secret,
         webauthn,
+        presign_ttl: std::time::Duration::from_secs(presign_ttl_secs),
+        share_expiry_secs: share_expiry_days * 24 * 60 * 60,
+        upload_session_max_secs: upload_session_max_hours * 60 * 60,
+        max_share_bytes,
     };
 
     // Spawn background cleanup worker (runs every hour)
@@ -173,19 +202,15 @@ async fn main() {
     // Setup routes
     let app = Router::new()
         // API routes
-        .route("/api/upload", post(upload_files))
         .route("/api/upload/init", post(upload_init))
-        .route(
-            "/api/upload/:uuid",
-            post(upload_chunk_or_file).delete(upload_abort),
-        )
+        .route("/api/upload/:uuid/presign", post(upload_presign))
         .route(
             "/api/upload/:uuid/multipart/init",
             post(upload_multipart_init),
         )
         .route(
-            "/api/upload/:uuid/multipart/part",
-            post(upload_multipart_part),
+            "/api/upload/:uuid/multipart/part-url",
+            post(upload_multipart_part_url),
         )
         .route(
             "/api/upload/:uuid/multipart/complete",
@@ -196,6 +221,7 @@ async fn main() {
         .route("/api/upload/:uuid/ping", post(upload_ping))
         .route("/api/share/:uuid", get(get_share).delete(delete_share))
         .route("/api/share/:uuid/file/*filename", get(download_file))
+        .route("/api/share/:uuid/file-url/*filename", get(get_download_url))
         // Service worker for streaming decrypted media preview
         .route("/sw.js", get(serve_service_worker))
         // Self-hosted vendored frontend assets (embedded at compile time so the
@@ -276,7 +302,7 @@ async fn main() {
         .route("/profile", get(serve_index))
         .fallback(serve_index)
         // Router configurations
-        .layer(DefaultBodyLimit::disable()) // Disable Axum's default 2MB multipart limit
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -662,8 +688,12 @@ async fn passkey_auth_finish(
         .await
         .map_err(|_| (StatusCode::UNAUTHORIZED, "User not found".to_string()))?;
 
-    let user_json: serde_json::Value = serde_json::from_slice(&user_bytes)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Invalid user data".to_string()))?;
+    let user_json: serde_json::Value = serde_json::from_slice(&user_bytes).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid user data".to_string(),
+        )
+    })?;
 
     let totp_enabled = user_json
         .get("totp_enabled")
@@ -676,8 +706,7 @@ async fn passkey_auth_finish(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if let Some(code) = &payload.totp_code {
-            if let Ok(secret) = totp_rs::Secret::Encoded(totp_secret.to_string()).to_bytes()
-            {
+            if let Ok(secret) = totp_rs::Secret::Encoded(totp_secret.to_string()).to_bytes() {
                 let totp = totp_rs::TOTP::new(
                     totp_rs::Algorithm::SHA1,
                     6,
@@ -687,9 +716,7 @@ async fn passkey_auth_finish(
                     Some("DillShare".to_string()),
                     username.to_string(),
                 )
-                .map_err(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "2FA Error".to_string())
-                })?;
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "2FA Error".to_string()))?;
 
                 if !totp.check_current(code).unwrap_or(false) {
                     return Err((StatusCode::FORBIDDEN, "INVALID_2FA".to_string()));
@@ -1005,11 +1032,317 @@ async fn serve_asset_marked() -> impl IntoResponse {
     )
 }
 
-// Multipart file uploader - requires authentication
-async fn upload_files(
+const DIRECT_PUT_MAX_BYTES: i64 = 16 * 1024 * 1024;
+const S3_PART_MAX_BYTES: i64 = 5 * 1024 * 1024 * 1024;
+const ENCRYPTION_CHUNK_BYTES: i64 = 4 * 1024 * 1024;
+const ENCRYPTION_OVERHEAD_BYTES: i64 = 28;
+const MAX_FILES_PER_SHARE: usize = 1_000;
+const METADATA_MAX_BYTES: i64 = 8 * 1024 * 1024;
+const THUMBNAIL_MAX_BYTES: i64 = 2 * 1024 * 1024;
+
+fn encrypted_file_size(plaintext_size: i64) -> Option<i64> {
+    if plaintext_size < 0 {
+        return None;
+    }
+    let chunks = if plaintext_size == 0 {
+        1
+    } else {
+        plaintext_size.checked_add(ENCRYPTION_CHUNK_BYTES - 1)? / ENCRYPTION_CHUNK_BYTES
+    };
+    plaintext_size.checked_add(chunks.checked_mul(ENCRYPTION_OVERHEAD_BYTES)?)
+}
+
+fn multipart_part_sizes(plaintext_size: i64) -> Option<Vec<i64>> {
+    let total_chunks = if plaintext_size == 0 {
+        1usize
+    } else {
+        usize::try_from(
+            plaintext_size.checked_add(ENCRYPTION_CHUNK_BYTES - 1)? / ENCRYPTION_CHUNK_BYTES,
+        )
+        .ok()?
+    };
+    let mut chunks_per_part = if plaintext_size >= 256 * 1024 * 1024 {
+        8usize
+    } else if plaintext_size >= 64 * 1024 * 1024 {
+        4usize
+    } else {
+        2usize
+    };
+    chunks_per_part = chunks_per_part.max((total_chunks + 8_999) / 9_000);
+
+    let mut sizes = Vec::with_capacity((total_chunks + chunks_per_part - 1) / chunks_per_part);
+    for start_chunk in (0..total_chunks).step_by(chunks_per_part) {
+        let end_chunk = (start_chunk + chunks_per_part).min(total_chunks);
+        let mut part_size = 0i64;
+        for chunk in start_chunk..end_chunk {
+            let start = i64::try_from(chunk)
+                .ok()?
+                .checked_mul(ENCRYPTION_CHUNK_BYTES)?;
+            let plaintext_chunk = plaintext_size
+                .saturating_sub(start)
+                .clamp(0, ENCRYPTION_CHUNK_BYTES);
+            part_size = part_size
+                .checked_add(plaintext_chunk)?
+                .checked_add(ENCRYPTION_OVERHEAD_BYTES)?;
+        }
+        if part_size <= 0 || part_size > S3_PART_MAX_BYTES {
+            return None;
+        }
+        sizes.push(part_size);
+    }
+    Some(sizes)
+}
+
+fn parse_canonical_file_id(value: &str) -> Option<usize> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let id = value.parse::<usize>().ok()?;
+    (id.to_string() == value).then_some(id)
+}
+
+fn payload_file_id(name: &str) -> Option<usize> {
+    let id = name.strip_prefix("file_")?.strip_suffix(".enc")?;
+    parse_canonical_file_id(id)
+}
+
+fn thumbnail_file_id(name: &str) -> Option<usize> {
+    let id = name.strip_prefix("file_")?.strip_suffix(".thumb.enc")?;
+    parse_canonical_file_id(id)
+}
+
+/// Only names generated by the client are allowed to become share object keys.
+fn is_valid_upload_filename(name: &str) -> bool {
+    name == "metadata.enc" || payload_file_id(name).is_some() || thumbnail_file_id(name).is_some()
+}
+
+fn is_valid_sha256_checksum(value: &str) -> bool {
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map(|bytes| bytes.len() == 32)
+        .unwrap_or(false)
+}
+
+fn validate_upload_uuid(value: &str) -> Result<(), (StatusCode, String)> {
+    let parsed = uuid::Uuid::parse_str(value)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid upload ID".to_string()))?;
+    if parsed.hyphenated().to_string() != value {
+        return Err((StatusCode::BAD_REQUEST, "Invalid upload ID".to_string()));
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ActiveUploadMarker {
+    owner: String,
+    created_at: i64,
+    file_sizes: Vec<i64>,
+    status: String,
+}
+
+async fn write_active_upload_marker(
+    state: &AppState,
+    uuid: &str,
+    marker: &ActiveUploadMarker,
+) -> Result<(), (StatusCode, String)> {
+    let bytes = serde_json::to_vec(marker)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state
+        .storage
+        .put_object(
+            &state.bucket,
+            &format!("uploads/{}/.active", uuid),
+            bytes,
+            Some("application/json"),
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to update upload session: {}", e),
+            )
+        })
+}
+
+async fn authorize_upload_marker(
+    state: &AppState,
+    uuid: &str,
+    username: &str,
+    allowed_claimed_status: Option<&str>,
+) -> Result<ActiveUploadMarker, (StatusCode, String)> {
+    validate_upload_uuid(uuid)?;
+
+    let owner_key = format!("uploads/{}/owner.txt", uuid);
+    if state
+        .storage
+        .head_object_info(&state.bucket, &owner_key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .is_some()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Upload session is already finalized".to_string(),
+        ));
+    }
+
+    let active_key = format!("uploads/{}/.active", uuid);
+    let bytes = state
+        .storage
+        .get_object_bytes(&state.bucket, &active_key)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                "Upload session not found".to_string(),
+            )
+        })?;
+    let marker: ActiveUploadMarker = serde_json::from_slice(&bytes).map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "Upload session is invalid; start a new upload".to_string(),
+        )
+    })?;
+    if marker.owner != username {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Upload session belongs to another user".to_string(),
+        ));
+    }
+    if marker.status != "active" && allowed_claimed_status != Some(marker.status.as_str()) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Upload session is being finalized or aborted".to_string(),
+        ));
+    }
+    if chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(marker.created_at)
+        > state.upload_session_max_secs
+    {
+        return Err((StatusCode::GONE, "Upload session has expired".to_string()));
+    }
+    Ok(marker)
+}
+
+async fn authorize_active_upload(
+    state: &AppState,
+    uuid: &str,
+    username: &str,
+) -> Result<ActiveUploadMarker, (StatusCode, String)> {
+    authorize_upload_marker(state, uuid, username, None).await
+}
+
+async fn claim_active_upload(
+    state: &AppState,
+    uuid: &str,
+    username: &str,
+    claimed_status: &str,
+) -> Result<ActiveUploadMarker, (StatusCode, String)> {
+    validate_upload_uuid(uuid)?;
+    let owner_key = format!("uploads/{}/owner.txt", uuid);
+    if state
+        .storage
+        .head_object_info(&state.bucket, &owner_key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .is_some()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Upload session is already finalized".to_string(),
+        ));
+    }
+
+    let active_key = format!("uploads/{}/.active", uuid);
+    let active_info = state
+        .storage
+        .head_object_info(&state.bucket, &active_key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Upload session not found".to_string(),
+            )
+        })?;
+    let e_tag = active_info.e_tag.ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Upload session has no S3 ETag".to_string(),
+        )
+    })?;
+    let bytes = state
+        .storage
+        .get_object_bytes(&state.bucket, &active_key)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                "Upload session not found".to_string(),
+            )
+        })?;
+    let mut marker: ActiveUploadMarker = serde_json::from_slice(&bytes).map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "Upload session is invalid; start a new upload".to_string(),
+        )
+    })?;
+    if marker.owner != username {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Upload session belongs to another user".to_string(),
+        ));
+    }
+    if chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(marker.created_at)
+        > state.upload_session_max_secs
+    {
+        return Err((StatusCode::GONE, "Upload session has expired".to_string()));
+    }
+    if marker.status == claimed_status {
+        return Ok(marker);
+    }
+    if marker.status != "active" {
+        return Err((
+            StatusCode::CONFLICT,
+            "Upload session has another operation in progress".to_string(),
+        ));
+    }
+
+    marker.status = claimed_status.to_string();
+    let claimed_bytes = serde_json::to_vec(&marker)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let claimed = state
+        .storage
+        .put_object_if_match(
+            &state.bucket,
+            &active_key,
+            claimed_bytes,
+            Some("application/json"),
+            &e_tag,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if !claimed {
+        return Err((
+            StatusCode::CONFLICT,
+            "Upload session changed concurrently; retry".to_string(),
+        ));
+    }
+    Ok(marker)
+}
+
+#[derive(serde::Deserialize)]
+struct UploadInitReq {
+    file_sizes: Vec<i64>,
+}
+
+async fn upload_init(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    multipart: Multipart,
+    axum::Json(payload): axum::Json<UploadInitReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
     let (username, _) = verify_session(&token, &state).await.ok_or_else(|| {
@@ -1019,219 +1352,53 @@ async fn upload_files(
         )
     })?;
 
-    let uuid = uuid::Uuid::new_v4().to_string();
-
-    let result: Result<axum::Json<serde_json::Value>, (StatusCode, String)> =
-        upload_files_inner(&state, &username, &uuid, multipart).await;
-
-    match result {
-        Ok(json) => Ok(json),
-        Err(err) => {
-            // Upload failed or aborted — remove anything already written for this share.
-            let prefix = format!("uploads/{}/", uuid);
-            tracing::warn!(
-                "Upload {} failed ({:?}); cleaning up S3 prefix '{}'",
-                uuid,
-                err,
-                prefix
-            );
-            if let Err(cleanup_err) = delete_s3_prefix(&state.storage, &state.bucket, &prefix).await
-            {
-                tracing::error!(
-                    "Failed to clean up aborted upload {}: {:?}",
-                    uuid,
-                    cleanup_err
-                );
-            }
-            Err(err)
-        }
+    if !state.storage.supports_presigning() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Direct file transfers require an S3 bucket".to_string(),
+        ));
     }
-}
-
-/// Validate a client-supplied file name before it becomes part of an S3 key.
-/// Rejects path separators, traversal, hidden/system filenames and reserved
-/// internal names so uploads can never clobber share metadata objects.
-fn is_valid_upload_filename(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.starts_with('.')
-        && name != "owner.txt"
-        && name != ".active"
-}
-
-async fn upload_files_inner(
-    state: &AppState,
-    username: &str,
-    uuid: &str,
-    mut multipart: Multipart,
-) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
-    let mut uploaded_files = Vec::new();
-    let mut total_size = 0;
-
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
-    {
-        let file_path = match field.file_name() {
-            Some(name) => name.to_string(),
-            None => continue,
-        };
-
-        if file_path.trim().is_empty() {
-            continue;
-        }
-
-        if !is_valid_upload_filename(&file_path) {
-            tracing::warn!(
-                "Rejecting upload with invalid file name '{:?}' for share {}",
-                file_path,
-                uuid
-            );
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Invalid file name (must not contain path separators or reserved names)"
-                    .to_string(),
-            ));
-        }
-
-        let content_type = mime_guess::from_path(&file_path)
-            .first_or_octet_stream()
-            .to_string();
-
-        let bytes = field
-            .bytes()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        total_size += bytes.len() as i64;
-
-        let key = format!("uploads/{}/{}", uuid, file_path);
-        tracing::info!("Uploading {} to S3 bucket '{}'...", file_path, state.bucket);
-
-        state
-            .storage
-            .put_object(&state.bucket, &key, bytes.to_vec(), Some(&content_type))
-            .await
-            .map_err(|e| {
-                tracing::error!("S3 PutObject error: {:?}", e);
+    if payload.file_sizes.is_empty() || payload.file_sizes.len() > MAX_FILES_PER_SHARE {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "A share must contain between 1 and {} files",
+                MAX_FILES_PER_SHARE
+            ),
+        ));
+    }
+    let mut expected_payload_bytes = 0i64;
+    for size in &payload.file_sizes {
+        let encrypted_size = encrypted_file_size(*size)
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid file size".to_string()))?;
+        expected_payload_bytes = expected_payload_bytes
+            .checked_add(encrypted_size)
+            .ok_or_else(|| {
                 (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to upload to S3: {:?}", e),
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Share is too large".to_string(),
                 )
             })?;
-
-        uploaded_files.push(file_path);
     }
-
-    if uploaded_files.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "No files uploaded".to_string()));
+    if expected_payload_bytes > state.max_share_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Share exceeds the configured storage limit".to_string(),
+        ));
     }
-
-    // Write owner record
-    let owner_key = format!("uploads/{}/owner.txt", uuid);
-    state
-        .storage
-        .put_object(
-            &state.bucket,
-            &owner_key,
-            username.as_bytes().to_vec().to_vec(),
-            Some("text/plain"),
-        )
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to save owner: {:?}", e),
-            )
-        })?;
-
-    // Actual user files count (excluding metadata.enc)
-    let files_count = uploaded_files
-        .iter()
-        .filter(|f| *f != "metadata.enc")
-        .count();
-
-    // Update user's public shares index in S3
-    let public_shares_key = format!("users/{}/public_shares.json", username);
-    let mut shares = match state
-        .storage
-        .get_object_bytes(&state.bucket, &public_shares_key)
-        .await
-    {
-        Ok(bytes) => {
-            if true {
-                serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }
-        Err(_) => Vec::new(),
-    };
-
-    shares.push(serde_json::json!({
-        "uuid": uuid,
-        "files_count": files_count,
-        "total_size": total_size,
-        "created_at": chrono::Utc::now().to_rfc3339()
-    }));
-
-    let shares_bytes = serde_json::to_vec(&shares)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    state
-        .storage
-        .put_object(
-            &state.bucket,
-            &public_shares_key,
-            shares_bytes.into(),
-            Some("application/json"),
-        )
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to save public shares list: {:?}", e),
-            )
-        })?;
-
-    Ok(axum::Json(serde_json::json!({
-        "uuid": uuid,
-        "files": uploaded_files
-    })))
-}
-
-async fn upload_init(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let token = extract_token(&headers)?;
-    let (_username, _) = verify_session(&token, &state).await.ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            "Invalid or expired session".to_string(),
-        )
-    })?;
 
     let uuid = uuid::Uuid::new_v4().to_string();
-
-    // Write initial active heartbeat marker
-    let active_key = format!("uploads/{}/.active", uuid);
-    let _ = state
-        .storage
-        .put_object(
-            &state.bucket,
-            &active_key,
-            b"active".to_vec().to_vec(),
-            Some("text/plain"),
-        )
-        .await;
+    let marker = ActiveUploadMarker {
+        owner: username,
+        created_at: chrono::Utc::now().timestamp(),
+        file_sizes: payload.file_sizes,
+        status: "active".to_string(),
+    };
+    write_active_upload_marker(&state, &uuid, &marker).await?;
 
     Ok(axum::Json(serde_json::json!({
-        "uuid": uuid
+        "uuid": uuid,
+        "upload_mode": "direct"
     })))
 }
 
@@ -1241,127 +1408,269 @@ async fn upload_ping(
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let (_username, _) = verify_session(&token, &state).await.ok_or_else(|| {
+    let (username, _) = verify_session(&token, &state).await.ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
             "Invalid or expired session".to_string(),
         )
     })?;
-
-    let active_key = format!("uploads/{}/.active", uuid);
-    state
-        .storage
-        .put_object(
-            &state.bucket,
-            &active_key,
-            b"active".to_vec().to_vec(),
-            Some("text/plain"),
-        )
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to update heartbeat: {:?}", e),
-            )
-        })?;
+    authorize_active_upload(&state, &uuid, &username).await?;
 
     Ok(axum::Json(serde_json::json!({ "status": "ok" })))
 }
 
-async fn upload_chunk_or_file(
+#[derive(serde::Deserialize)]
+struct UploadPresignReq {
+    file_name: String,
+    content_length: i64,
+    checksum_sha256: String,
+}
+
+async fn upload_presign(
     State(state): State<AppState>,
     Path(uuid): Path<String>,
     headers: axum::http::HeaderMap,
-    mut multipart: Multipart,
+    axum::Json(payload): axum::Json<UploadPresignReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let (_username, _) = verify_session(&token, &state).await.ok_or_else(|| {
+    let (username, _) = verify_session(&token, &state).await.ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
             "Invalid or expired session".to_string(),
         )
     })?;
+    let marker = authorize_active_upload(&state, &uuid, &username).await?;
 
-    let mut uploaded_files = Vec::new();
-
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+    if !is_valid_upload_filename(&payload.file_name)
+        || !is_valid_sha256_checksum(&payload.checksum_sha256)
     {
-        let file_path = match field.file_name() {
-            Some(name) => name.to_string(),
-            None => continue,
-        };
-
-        if file_path.trim().is_empty() {
-            continue;
+        return Err((StatusCode::BAD_REQUEST, "Invalid file name".to_string()));
+    }
+    let maximum_size = if payload.file_name == "metadata.enc" {
+        METADATA_MAX_BYTES
+    } else if let Some(id) = thumbnail_file_id(&payload.file_name) {
+        if id >= marker.file_sizes.len() {
+            return Err((StatusCode::BAD_REQUEST, "Invalid file ID".to_string()));
         }
-
-        if !is_valid_upload_filename(&file_path) {
-            tracing::warn!(
-                "Rejecting upload with invalid file name '{:?}' for share {}",
-                file_path,
-                uuid
-            );
+        THUMBNAIL_MAX_BYTES
+    } else if let Some(id) = payload_file_id(&payload.file_name) {
+        let plaintext_size = marker
+            .file_sizes
+            .get(id)
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid file ID".to_string()))?;
+        let expected_size = encrypted_file_size(*plaintext_size)
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid file size".to_string()))?;
+        if payload.content_length != expected_size {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "Invalid file name (must not contain path separators or reserved names)"
-                    .to_string(),
+                "Encrypted file size does not match the upload declaration".to_string(),
             ));
         }
-
-        let content_type = mime_guess::from_path(&file_path)
-            .first_or_octet_stream()
-            .to_string();
-
-        let bytes = field
-            .bytes()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        let key = format!("uploads/{}/{}", uuid, file_path);
-        tracing::info!("Uploading {} to S3 bucket '{}'...", file_path, state.bucket);
-
-        state
-            .storage
-            .put_object(&state.bucket, &key, bytes.to_vec(), Some(&content_type))
-            .await
-            .map_err(|e| {
-                tracing::error!("S3 PutObject error: {:?}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to upload to S3: {:?}", e),
-                )
-            })?;
-
-        uploaded_files.push(file_path);
+        DIRECT_PUT_MAX_BYTES
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "Invalid file name".to_string()));
+    };
+    if !(1..=maximum_size).contains(&payload.content_length) {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Direct PUT size must be between 1 and {} bytes",
+                maximum_size
+            ),
+        ));
     }
 
-    // Refresh active heartbeat timestamp on chunk/file activity asynchronously
-    let active_key = format!("uploads/{}/.active", uuid);
-    tokio::spawn(async move {
-        let _ = state
-            .storage
-            .put_object(
-                &state.bucket,
-                &active_key,
-                b"active".to_vec().to_vec(),
-                Some("text/plain"),
-            )
-            .await;
-    });
+    let key = format!("uploads/{}/{}", uuid, payload.file_name);
+    if let Some(existing) = state
+        .storage
+        .head_object_info(&state.bucket, &key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+    {
+        if existing.size == payload.content_length {
+            return Ok(axum::Json(serde_json::json!({
+                "already_uploaded": true
+            })));
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            "An object with this name already exists with a different size".to_string(),
+        ));
+    }
+
+    let request = state
+        .storage
+        .presign_put_object(
+            &state.bucket,
+            &key,
+            payload.content_length,
+            &payload.checksum_sha256,
+            state.presign_ttl,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(axum::Json(serde_json::json!({
-        "status": "ok",
-        "uploaded": uploaded_files
+        "already_uploaded": false,
+        "method": request.method,
+        "url": request.url,
+        "headers": request.headers,
+        "expires_in": state.presign_ttl.as_secs()
     })))
 }
 
 #[derive(serde::Deserialize)]
 struct UploadFinishReq {
-    files_count: Option<usize>,
-    total_size: Option<i64>,
+    files_count: usize,
+    total_size: i64,
+}
+
+const FINALIZED_MANIFEST_NAME: &str = ".manifest.json";
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct FinalizedShareManifest {
+    version: u8,
+    owner: String,
+    created_at: i64,
+    expires_at: i64,
+    plaintext_size: i64,
+    stored_size: i64,
+    files: std::collections::BTreeMap<String, i64>,
+}
+
+async fn load_finalized_manifest(
+    state: &AppState,
+    uuid: &str,
+) -> Result<Option<FinalizedShareManifest>, (StatusCode, String)> {
+    let key = format!("uploads/{}/{}", uuid, FINALIZED_MANIFEST_NAME);
+    if state
+        .storage
+        .head_object_info(&state.bucket, &key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let bytes = state
+        .storage
+        .get_object_bytes(&state.bucket, &key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let manifest = serde_json::from_slice(&bytes).map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "Share manifest is invalid".to_string(),
+        )
+    })?;
+    Ok(Some(manifest))
+}
+
+async fn prune_share_to_manifest(
+    storage: &storage::Storage,
+    bucket: &str,
+    uuid: &str,
+) -> Result<(), String> {
+    let manifest_key = format!("uploads/{}/{}", uuid, FINALIZED_MANIFEST_NAME);
+    let bytes = storage.get_object_bytes(bucket, &manifest_key).await?;
+    let manifest: FinalizedShareManifest =
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let prefix = format!("uploads/{}/", uuid);
+    let mut allowed = std::collections::HashSet::new();
+    allowed.insert(format!("{}owner.txt", prefix));
+    allowed.insert(manifest_key);
+    for file_name in manifest.files.keys() {
+        allowed.insert(format!("{}{}", prefix, file_name));
+    }
+
+    let objects = storage.list_objects(bucket, Some(&prefix), None).await?;
+    let extra_keys: Vec<String> = objects
+        .into_iter()
+        .map(|object| object.key)
+        .filter(|key| !allowed.contains(key))
+        .collect();
+    storage.delete_objects_batch(bucket, &extra_keys).await?;
+
+    if let Ok(multipart_uploads) = storage.list_multipart_uploads(bucket).await {
+        for upload in multipart_uploads {
+            if upload.key.starts_with(&prefix) {
+                let _ = storage
+                    .abort_multipart_upload(bucket, &upload.key, &upload.upload_id)
+                    .await;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn upsert_public_share(
+    state: &AppState,
+    username: &str,
+    share: serde_json::Value,
+) -> Result<(), (StatusCode, String)> {
+    let key = format!("users/{}/public_shares.json", username);
+    let uuid = share
+        .get("uuid")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Public share record has no UUID".to_string(),
+            )
+        })?
+        .to_string();
+
+    for _ in 0..8 {
+        match state
+            .storage
+            .get_object_bytes_with_etag(&state.bucket, &key)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        {
+            Some((bytes, e_tag)) => {
+                let mut shares =
+                    serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default();
+                shares.retain(|entry| {
+                    entry.get("uuid").and_then(|value| value.as_str()) != Some(uuid.as_str())
+                });
+                shares.push(share.clone());
+                let updated = serde_json::to_vec(&shares)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                if state
+                    .storage
+                    .put_object_if_match(
+                        &state.bucket,
+                        &key,
+                        updated,
+                        Some("application/json"),
+                        &e_tag,
+                    )
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+                {
+                    return Ok(());
+                }
+            }
+            None => {
+                let initial = serde_json::to_vec(&vec![share.clone()])
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                if state
+                    .storage
+                    .put_object_if_absent(&state.bucket, &key, initial, Some("application/json"))
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+                {
+                    return Ok(());
+                }
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+
+    Err((
+        StatusCode::CONFLICT,
+        "Share index changed too many times; retry finalization".to_string(),
+    ))
 }
 
 async fn upload_finish(
@@ -1378,106 +1687,302 @@ async fn upload_finish(
         )
     })?;
 
-    // Write owner record
+    validate_upload_uuid(&uuid)?;
     let owner_key = format!("uploads/{}/owner.txt", uuid);
-    state
+    if let Ok(owner_bytes) = state
         .storage
-        .put_object(
-            &state.bucket,
-            &owner_key,
-            username.as_bytes().to_vec().to_vec(),
-            Some("text/plain"),
-        )
+        .get_object_bytes(&state.bucket, &owner_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to save owner: {:?}", e),
+    {
+        let owner = String::from_utf8(owner_bytes).unwrap_or_default();
+        if owner.trim() != username {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Share belongs to another user".to_string(),
+            ));
+        }
+        let manifest_bytes = state
+            .storage
+            .get_object_bytes(
+                &state.bucket,
+                &format!("uploads/{}/{}", uuid, FINALIZED_MANIFEST_NAME),
             )
-        })?;
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    "Finalized share manifest is missing".to_string(),
+                )
+            })?;
+        let manifest: FinalizedShareManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    "Finalized share manifest is invalid".to_string(),
+                )
+            })?;
+        let files_count = manifest
+            .files
+            .keys()
+            .filter(|name| payload_file_id(name).is_some())
+            .count();
+        if manifest.owner != username
+            || manifest.plaintext_size != payload.total_size
+            || files_count != payload.files_count
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "Finalized share does not match this request".to_string(),
+            ));
+        }
+        let created_at = chrono::DateTime::<chrono::Utc>::from_timestamp(manifest.created_at, 0)
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
+        upsert_public_share(
+            &state,
+            &username,
+            serde_json::json!({
+                "uuid": uuid,
+                "files_count": files_count,
+                "total_size": manifest.plaintext_size,
+                "stored_size": manifest.stored_size,
+                "created_at": created_at
+            }),
+        )
+        .await?;
+        return Ok(axum::Json(serde_json::json!({
+            "uuid": uuid,
+            "files": manifest.files.keys().collect::<Vec<_>>()
+        })));
+    }
+    let marker = authorize_upload_marker(&state, &uuid, &username, Some("finishing")).await?;
 
-    // List files under uploads/{uuid}/ to count and check uploaded files
+    let declared_total_size = marker
+        .file_sizes
+        .iter()
+        .try_fold(0i64, |total, size| total.checked_add(*size));
+    if payload.files_count != marker.file_sizes.len()
+        || declared_total_size != Some(payload.total_size)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Finalized share does not match the upload declaration".to_string(),
+        ));
+    }
+
     let prefix = format!("uploads/{}/", uuid);
     let mut uploaded_files = Vec::new();
-    let mut s3_total_size: i64 = 0;
+    let mut manifest_files = std::collections::BTreeMap::new();
+    let mut control_keys = Vec::new();
+    let mut stored_size = 0i64;
+    let mut payload_ids = std::collections::HashSet::new();
+    let mut has_metadata = false;
 
-    let list_res = state
+    let objects = state
         .storage
         .list_objects(&state.bucket, Some(&prefix), None)
-        .await;
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    if let Ok(out) = list_res {
-        if true {
-            let objects = out;
-            for obj in objects {
-                if true {
-                    let k = &obj.key;
-                    let rel_path = k.strip_prefix(&prefix).unwrap_or(&k).to_string();
-                    if rel_path != "owner.txt" && rel_path != ".active" {
-                        uploaded_files.push(rel_path.clone());
-                    }
-                    if rel_path != "owner.txt"
-                        && rel_path != ".active"
-                        && rel_path != "metadata.enc"
-                        && !rel_path.ends_with(".thumb.enc")
-                    {
-                        s3_total_size += obj.size;
-                    }
-                }
+    for object in objects {
+        let relative = object
+            .key
+            .strip_prefix(&prefix)
+            .unwrap_or(&object.key)
+            .to_string();
+        if relative == ".active" || relative == FINALIZED_MANIFEST_NAME {
+            continue;
+        }
+        if relative.starts_with(".multipart-") && relative.ends_with(".json") {
+            control_keys.push(object.key);
+            continue;
+        }
+        if relative == "metadata.enc" {
+            has_metadata = (1..=METADATA_MAX_BYTES).contains(&object.size);
+            if !has_metadata {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Encrypted metadata exceeds the allowed size".to_string(),
+                ));
             }
+        } else if let Some(id) = payload_file_id(&relative) {
+            let expected_size = marker
+                .file_sizes
+                .get(id)
+                .and_then(|size| encrypted_file_size(*size));
+            if expected_size != Some(object.size) || !payload_ids.insert(id) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Uploaded file set does not match the finalized share".to_string(),
+                ));
+            }
+        } else if let Some(id) = thumbnail_file_id(&relative) {
+            if id >= marker.file_sizes.len() || !(1..=THUMBNAIL_MAX_BYTES).contains(&object.size) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Uploaded thumbnail set does not match the finalized share".to_string(),
+                ));
+            }
+        } else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Upload contains an unexpected object".to_string(),
+            ));
+        }
+        stored_size = stored_size.checked_add(object.size).ok_or_else(|| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Share is too large".to_string(),
+            )
+        })?;
+        manifest_files.insert(relative.clone(), object.size);
+        uploaded_files.push(relative);
+    }
+
+    if !has_metadata || payload_ids.len() != payload.files_count {
+        return Err((StatusCode::BAD_REQUEST, "Upload is incomplete".to_string()));
+    }
+    for id in 0..payload.files_count {
+        if !payload_ids.contains(&id) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Upload file IDs must be contiguous".to_string(),
+            ));
         }
     }
 
-    let files_count = payload.files_count.unwrap_or_else(|| {
-        uploaded_files
-            .iter()
-            .filter(|f| *f != "metadata.enc" && !f.ends_with(".thumb.enc"))
-            .count()
-    });
-    let total_size = payload.total_size.unwrap_or(s3_total_size);
+    if stored_size > state.max_share_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Share exceeds the configured storage limit".to_string(),
+        ));
+    }
 
-    // Update user's public shares index in S3
-    let public_shares_key = format!("users/{}/public_shares.json", username);
-    let mut shares = match state
-        .storage
-        .get_object_bytes(&state.bucket, &public_shares_key)
-        .await
+    let claimed_marker = claim_active_upload(&state, &uuid, &username, "finishing").await?;
+    if claimed_marker.created_at != marker.created_at
+        || claimed_marker.file_sizes != marker.file_sizes
     {
-        Ok(bytes) => {
-            if true {
-                serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }
-        Err(_) => Vec::new(),
+        return Err((
+            StatusCode::CONFLICT,
+            "Upload declaration changed during finalization".to_string(),
+        ));
+    }
+
+    let finished_at = chrono::Utc::now().timestamp();
+    let manifest = FinalizedShareManifest {
+        version: 1,
+        owner: username.clone(),
+        created_at: marker.created_at,
+        expires_at: finished_at.saturating_add(state.share_expiry_secs),
+        plaintext_size: payload.total_size,
+        stored_size,
+        files: manifest_files,
     };
-
-    shares.push(serde_json::json!({
-        "uuid": uuid,
-        "files_count": files_count,
-        "total_size": total_size,
-        "created_at": chrono::Utc::now().to_rfc3339()
-    }));
-
-    let shares_bytes = serde_json::to_vec(&shares)
+    let manifest_bytes = serde_json::to_vec(&manifest)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     state
         .storage
         .put_object(
             &state.bucket,
-            &public_shares_key,
-            shares_bytes.into(),
+            &format!("{}{}", prefix, FINALIZED_MANIFEST_NAME),
+            manifest_bytes,
             Some("application/json"),
         )
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to save public shares list: {:?}", e),
+                format!("Failed to save finalized share manifest: {}", e),
             )
         })?;
+
+    let created_at = chrono::DateTime::<chrono::Utc>::from_timestamp(marker.created_at, 0)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339();
+    upsert_public_share(
+        &state,
+        &username,
+        serde_json::json!({
+            "uuid": uuid,
+            "files_count": payload.files_count,
+            "total_size": payload.total_size,
+            "stored_size": stored_size,
+            "created_at": created_at
+        }),
+    )
+    .await?;
+
+    let owner_created = state
+        .storage
+        .put_object_if_absent(
+            &state.bucket,
+            &owner_key,
+            username.as_bytes().to_vec(),
+            Some("text/plain"),
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save owner: {}", e),
+            )
+        })?;
+    if !owner_created {
+        let existing_owner = state
+            .storage
+            .get_object_bytes(&state.bucket, &owner_key)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        if String::from_utf8(existing_owner).unwrap_or_default().trim() != username {
+            return Err((
+                StatusCode::CONFLICT,
+                "Share was finalized by another user".to_string(),
+            ));
+        }
+    }
+
+    let active_key = format!("uploads/{}/.active", uuid);
+    if let Err(error) = state
+        .storage
+        .delete_object(&state.bucket, &active_key)
+        .await
+    {
+        tracing::warn!(
+            "Failed to remove finalized upload marker for {}: {}",
+            uuid,
+            error
+        );
+    }
+    if let Err(error) = state
+        .storage
+        .delete_objects_batch(&state.bucket, &control_keys)
+        .await
+    {
+        tracing::warn!(
+            "Failed to remove multipart control records for {}: {}",
+            uuid,
+            error
+        );
+    }
+
+    let cleanup_storage = state.storage.clone();
+    let cleanup_bucket = state.bucket.clone();
+    let cleanup_uuid = uuid.clone();
+    let cleanup_delay = state.presign_ttl + std::time::Duration::from_secs(5);
+    tokio::spawn(async move {
+        tokio::time::sleep(cleanup_delay).await;
+        if let Err(error) =
+            prune_share_to_manifest(&cleanup_storage, &cleanup_bucket, &cleanup_uuid).await
+        {
+            tracing::warn!(
+                "Failed to prune post-finalization objects for {}: {}",
+                cleanup_uuid,
+                error
+            );
+        }
+    });
+
+    uploaded_files.sort();
 
     Ok(axum::Json(serde_json::json!({
         "uuid": uuid,
@@ -1491,12 +1996,13 @@ async fn upload_abort(
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let (_username, _) = verify_session(&token, &state).await.ok_or_else(|| {
+    let (username, _) = verify_session(&token, &state).await.ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
             "Invalid or expired session".to_string(),
         )
     })?;
+    claim_active_upload(&state, &uuid, &username, "aborting").await?;
 
     let prefix = format!("uploads/{}/", uuid);
     tracing::info!(
@@ -1504,7 +2010,38 @@ async fn upload_abort(
         uuid,
         prefix
     );
+    if let Ok(multipart_uploads) = state.storage.list_multipart_uploads(&state.bucket).await {
+        for upload in multipart_uploads {
+            if upload.key.starts_with(&prefix) {
+                let _ = state
+                    .storage
+                    .abort_multipart_upload(&state.bucket, &upload.key, &upload.upload_id)
+                    .await;
+            }
+        }
+    }
     delete_s3_prefix(&state.storage, &state.bucket, &prefix).await?;
+
+    let cleanup_storage = state.storage.clone();
+    let cleanup_bucket = state.bucket.clone();
+    let cleanup_prefix = prefix.clone();
+    let cleanup_delay = state.presign_ttl + std::time::Duration::from_secs(5);
+    tokio::spawn(async move {
+        tokio::time::sleep(cleanup_delay).await;
+        if let Ok(multipart_uploads) = cleanup_storage
+            .list_multipart_uploads(&cleanup_bucket)
+            .await
+        {
+            for upload in multipart_uploads {
+                if upload.key.starts_with(&cleanup_prefix) {
+                    let _ = cleanup_storage
+                        .abort_multipart_upload(&cleanup_bucket, &upload.key, &upload.upload_id)
+                        .await;
+                }
+            }
+        }
+        let _ = delete_s3_prefix(&cleanup_storage, &cleanup_bucket, &cleanup_prefix).await;
+    });
 
     Ok(axum::Json(serde_json::json!({ "status": "aborted" })))
 }
@@ -1514,6 +2051,19 @@ struct MultipartInitReq {
     file_name: String,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct MultipartUploadRecord {
+    upload_id: String,
+    file_name: String,
+    part_sizes: Vec<i64>,
+    #[serde(default)]
+    completed: bool,
+}
+
+fn multipart_record_key(uuid: &str, file_id: usize) -> String {
+    format!("uploads/{}/.multipart-{}.json", uuid, file_id)
+}
+
 async fn upload_multipart_init(
     State(state): State<AppState>,
     Path(uuid): Path<String>,
@@ -1521,29 +2071,76 @@ async fn upload_multipart_init(
     axum::Json(payload): axum::Json<MultipartInitReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let (_username, _) = verify_session(&token, &state).await.ok_or_else(|| {
+    let (username, _) = verify_session(&token, &state).await.ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
             "Invalid or expired session".to_string(),
         )
     })?;
+    let marker = authorize_active_upload(&state, &uuid, &username).await?;
 
-    if !is_valid_upload_filename(&payload.file_name) {
-        return Err((
+    let file_id = payload_file_id(&payload.file_name).ok_or_else(|| {
+        (
             StatusCode::BAD_REQUEST,
-            "Invalid file name (must not contain path separators or reserved names)"
-                .to_string(),
+            "Multipart uploads are only allowed for encrypted file payloads".to_string(),
+        )
+    })?;
+    let plaintext_size = marker
+        .file_sizes
+        .get(file_id)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid file ID".to_string()))?;
+    let part_sizes = multipart_part_sizes(*plaintext_size).ok_or_else(|| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "File cannot be represented as a valid S3 multipart upload".to_string(),
+        )
+    })?;
+    if part_sizes.len() > 10_000 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "File requires too many multipart parts".to_string(),
         ));
     }
 
     let key = format!("uploads/{}/{}", uuid, payload.file_name);
-    let content_type = mime_guess::from_path(&payload.file_name)
-        .first_or_octet_stream()
-        .to_string();
+    let record_key = multipart_record_key(&uuid, file_id);
+    if let Ok(bytes) = state
+        .storage
+        .get_object_bytes(&state.bucket, &record_key)
+        .await
+    {
+        let record: MultipartUploadRecord = serde_json::from_slice(&bytes).map_err(|_| {
+            (
+                StatusCode::CONFLICT,
+                "Multipart upload state is invalid; restart the share".to_string(),
+            )
+        })?;
+        if record.file_name == payload.file_name && record.part_sizes == part_sizes {
+            return Ok(axum::Json(serde_json::json!({
+                "upload_id": record.upload_id
+            })));
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            "A different multipart upload already exists for this file".to_string(),
+        ));
+    }
+    if state
+        .storage
+        .head_object_info(&state.bucket, &key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .is_some()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "File payload already exists".to_string(),
+        ));
+    }
 
     let upload_id = state
         .storage
-        .create_multipart_upload(&state.bucket, &key, Some(&content_type))
+        .create_multipart_upload(&state.bucket, &key, Some("application/octet-stream"))
         .await
         .map_err(|e| {
             (
@@ -1552,81 +2149,186 @@ async fn upload_multipart_init(
             )
         })?;
 
+    let record = MultipartUploadRecord {
+        upload_id: upload_id.clone(),
+        file_name: payload.file_name,
+        part_sizes,
+        completed: false,
+    };
+    let record_bytes = serde_json::to_vec(&record)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let record_created = match state
+        .storage
+        .put_object_if_absent(
+            &state.bucket,
+            &record_key,
+            record_bytes,
+            Some("application/json"),
+        )
+        .await
+    {
+        Ok(created) => created,
+        Err(error) => {
+            let _ = state
+                .storage
+                .abort_multipart_upload(&state.bucket, &key, &upload_id)
+                .await;
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save multipart upload state: {}", error),
+            ));
+        }
+    };
+    if !record_created {
+        let _ = state
+            .storage
+            .abort_multipart_upload(&state.bucket, &key, &upload_id)
+            .await;
+        let bytes = state
+            .storage
+            .get_object_bytes(&state.bucket, &record_key)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    "Multipart upload was initialized concurrently; retry".to_string(),
+                )
+            })?;
+        let existing: MultipartUploadRecord = serde_json::from_slice(&bytes).map_err(|_| {
+            (
+                StatusCode::CONFLICT,
+                "Multipart upload state is invalid; restart the share".to_string(),
+            )
+        })?;
+        if existing.file_name == record.file_name && existing.part_sizes == record.part_sizes {
+            return Ok(axum::Json(serde_json::json!({
+                "upload_id": existing.upload_id
+            })));
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            "A different multipart upload already exists for this file".to_string(),
+        ));
+    }
+
     Ok(axum::Json(serde_json::json!({ "upload_id": upload_id })))
 }
 
 #[derive(serde::Deserialize)]
-struct MultipartPartQuery {
+struct MultipartPartUrlReq {
     upload_id: String,
     part_number: i32,
     file_name: String,
+    content_length: i64,
+    checksum_sha256: String,
 }
 
-async fn upload_multipart_part(
+async fn upload_multipart_part_url(
     State(state): State<AppState>,
     Path(uuid): Path<String>,
-    axum::extract::Query(query): axum::extract::Query<MultipartPartQuery>,
     headers: axum::http::HeaderMap,
-    bytes: axum::body::Bytes,
+    axum::Json(payload): axum::Json<MultipartPartUrlReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let (_username, _) = verify_session(&token, &state).await.ok_or_else(|| {
+    let (username, _) = verify_session(&token, &state).await.ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
             "Invalid or expired session".to_string(),
         )
     })?;
+    authorize_active_upload(&state, &uuid, &username).await?;
 
-    if !is_valid_upload_filename(&query.file_name) {
-        return Err((
+    let file_id = payload_file_id(&payload.file_name).ok_or_else(|| {
+        (
             StatusCode::BAD_REQUEST,
-            "Invalid file name (must not contain path separators or reserved names)"
-                .to_string(),
-        ));
-    }
-    if !(1..=10_000).contains(&query.part_number) {
+            "Multipart uploads are only allowed for encrypted file payloads".to_string(),
+        )
+    })?;
+    if !(1..=10_000).contains(&payload.part_number) {
         return Err((
             StatusCode::BAD_REQUEST,
             "Part number must be between 1 and 10000".to_string(),
         ));
     }
+    if !(1..=S3_PART_MAX_BYTES).contains(&payload.content_length)
+        || !is_valid_sha256_checksum(&payload.checksum_sha256)
+    {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Multipart part size is outside S3 limits".to_string(),
+        ));
+    }
+    if payload.upload_id.is_empty()
+        || payload.upload_id.len() > 1024
+        || !payload
+            .upload_id
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic())
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid upload ID".to_string()));
+    }
 
-    let key = format!("uploads/{}/{}", uuid, query.file_name);
-
-    let e_tag = state
+    let key = format!("uploads/{}/{}", uuid, payload.file_name);
+    let record_bytes = state
         .storage
-        .upload_part(
+        .get_object_bytes(&state.bucket, &multipart_record_key(&uuid, file_id))
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                "Multipart upload session not found".to_string(),
+            )
+        })?;
+    let record: MultipartUploadRecord = serde_json::from_slice(&record_bytes).map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "Multipart upload state is invalid; restart the share".to_string(),
+        )
+    })?;
+    let expected_size = record
+        .part_sizes
+        .get((payload.part_number - 1) as usize)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid part number".to_string()))?;
+    if record.upload_id != payload.upload_id
+        || record.file_name != payload.file_name
+        || *expected_size != payload.content_length
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Multipart part does not match the declared upload".to_string(),
+        ));
+    }
+    if record.completed {
+        return Err((
+            StatusCode::CONFLICT,
+            "Multipart upload is already complete".to_string(),
+        ));
+    }
+
+    let request = state
+        .storage
+        .presign_upload_part(
             &state.bucket,
             &key,
-            &query.upload_id,
-            query.part_number,
-            bytes.to_vec(),
+            &payload.upload_id,
+            payload.part_number,
+            payload.content_length,
+            &payload.checksum_sha256,
+            state.presign_ttl,
         )
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to upload part: {:?}", e),
+                format!("Failed to sign multipart upload: {}", e),
             )
         })?;
 
-    // Refresh active heartbeat timestamp on part activity asynchronously
-    let active_key = format!("uploads/{}/.active", uuid);
-    tokio::spawn(async move {
-        let _ = state
-            .storage
-            .put_object(
-                &state.bucket,
-                &active_key,
-                b"active".to_vec().to_vec(),
-                Some("text/plain"),
-            )
-            .await;
-    });
-
     Ok(axum::Json(serde_json::json!({
-        "part_number": query.part_number,
-        "e_tag": e_tag
+        "method": request.method,
+        "url": request.url,
+        "headers": request.headers,
+        "expires_in": state.presign_ttl.as_secs()
     })))
 }
 
@@ -1634,6 +2336,7 @@ async fn upload_multipart_part(
 struct CompletedPartReq {
     part_number: i32,
     e_tag: String,
+    checksum_sha256: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -1650,20 +2353,136 @@ async fn upload_multipart_complete(
     axum::Json(payload): axum::Json<MultipartCompleteReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
-    let (_username, _) = verify_session(&token, &state).await.ok_or_else(|| {
+    let (username, _) = verify_session(&token, &state).await.ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
             "Invalid or expired session".to_string(),
         )
     })?;
+    authorize_active_upload(&state, &uuid, &username).await?;
+
+    let file_id = payload_file_id(&payload.file_name).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Multipart uploads are only allowed for encrypted file payloads".to_string(),
+        )
+    })?;
+    if payload.upload_id.is_empty() || payload.upload_id.len() > 1024 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid upload ID".to_string()));
+    }
+    if payload.parts.is_empty() || payload.parts.len() > 10_000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Multipart upload must contain between 1 and 10000 parts".to_string(),
+        ));
+    }
+    let record_key = multipart_record_key(&uuid, file_id);
+    let record_bytes = state
+        .storage
+        .get_object_bytes(&state.bucket, &record_key)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                "Multipart upload session not found".to_string(),
+            )
+        })?;
+    let mut record: MultipartUploadRecord =
+        serde_json::from_slice(&record_bytes).map_err(|_| {
+            (
+                StatusCode::CONFLICT,
+                "Multipart upload state is invalid; restart the share".to_string(),
+            )
+        })?;
+    if record.upload_id != payload.upload_id
+        || record.file_name != payload.file_name
+        || record.part_sizes.len() != payload.parts.len()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Multipart completion does not match the declared upload".to_string(),
+        ));
+    }
+    let expected_object_size = record
+        .part_sizes
+        .iter()
+        .try_fold(0i64, |total, size| total.checked_add(*size));
+    if record.completed {
+        let existing = state
+            .storage
+            .head_object_info(
+                &state.bucket,
+                &format!("uploads/{}/{}", uuid, payload.file_name),
+            )
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        if existing.as_ref().map(|object| object.size) == expected_object_size {
+            return Ok(axum::Json(serde_json::json!({ "status": "ok" })));
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            "Completed multipart object is missing or has the wrong size".to_string(),
+        ));
+    }
+    for (index, part) in payload.parts.iter().enumerate() {
+        if part.part_number != (index + 1) as i32 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Multipart part numbers must be unique, ordered, and contiguous".to_string(),
+            ));
+        }
+        if part.e_tag.is_empty()
+            || part.e_tag.len() > 256
+            || part.e_tag.chars().any(char::is_control)
+            || !is_valid_sha256_checksum(&part.checksum_sha256)
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Invalid multipart ETag".to_string(),
+            ));
+        }
+    }
 
     let key = format!("uploads/{}/{}", uuid, payload.file_name);
+
+    if let Some(existing) = state
+        .storage
+        .head_object_info(&state.bucket, &key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+    {
+        if Some(existing.size) != expected_object_size {
+            return Err((
+                StatusCode::CONFLICT,
+                "Existing multipart object has the wrong size".to_string(),
+            ));
+        }
+        let _ = state
+            .storage
+            .abort_multipart_upload(&state.bucket, &key, &payload.upload_id)
+            .await;
+        record.completed = true;
+        let completed_record = serde_json::to_vec(&record)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        state
+            .storage
+            .put_object(
+                &state.bucket,
+                &record_key,
+                completed_record,
+                Some("application/json"),
+            )
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        return Ok(axum::Json(serde_json::json!({ "status": "ok" })));
+    }
 
     let mut completed_parts = Vec::new();
     for p in payload.parts {
         let completed_part = crate::storage::CompletedPart {
             part_number: p.part_number,
             e_tag: p.e_tag,
+            checksum_sha256: p.checksum_sha256,
         };
         completed_parts.push(completed_part);
     }
@@ -1679,6 +2498,25 @@ async fn upload_multipart_complete(
             )
         })?;
 
+    record.completed = true;
+    let completed_record = serde_json::to_vec(&record)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state
+        .storage
+        .put_object(
+            &state.bucket,
+            &record_key,
+            completed_record,
+            Some("application/json"),
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save completed multipart state: {}", e),
+            )
+        })?;
+
     Ok(axum::Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -1687,7 +2525,27 @@ async fn get_share(
     State(state): State<AppState>,
     Path(uuid): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_upload_uuid(&uuid)?;
     let prefix = format!("uploads/{}/", uuid);
+    let owner_key = format!("uploads/{}/owner.txt", uuid);
+    let owner_info = state
+        .storage
+        .head_object_info(&state.bucket, &owner_key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Share not found or expired".to_string(),
+            )
+        })?;
+    let now = chrono::Utc::now().timestamp();
+    if now.saturating_sub(owner_info.last_modified_secs) > state.share_expiry_secs {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Share not found or expired".to_string(),
+        ));
+    }
 
     #[derive(serde::Serialize)]
     struct ShareFile {
@@ -1706,45 +2564,58 @@ async fn get_share(
     }
 
     let mut files = Vec::new();
-    let mut latest_upload_time = chrono::Utc::now();
+    let latest_upload_time =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(owner_info.last_modified_secs, 0)
+            .unwrap_or_else(chrono::Utc::now);
     let mut has_objects = false;
+    let manifest = load_finalized_manifest(&state, &uuid).await?;
 
-    let objects = state
-        .storage
-        .list_objects(&state.bucket, Some(&prefix), None)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    for object in objects {
-        let key = object.key;
-        let size = object.size;
-        let last_modified_secs = object.last_modified_secs;
-
-        let file_name = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
-        if file_name == "owner.txt" || file_name == ".active" {
-            continue;
+    if let Some(manifest) = &manifest {
+        if manifest.expires_at <= now {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "Share not found or expired".to_string(),
+            ));
         }
+        has_objects = manifest.files.contains_key("metadata.enc");
+        for (file_name, size) in &manifest.files {
+            if payload_file_id(file_name).is_some() {
+                files.push(ShareFile {
+                    name: file_name.clone(),
+                    size: *size,
+                });
+            }
+        }
+    } else {
+        // Read-only compatibility for shares finalized before manifests existed.
+        let objects = state
+            .storage
+            .list_objects(&state.bucket, Some(&prefix), None)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-        let upload_time = chrono::DateTime::<chrono::Utc>::from_timestamp(last_modified_secs, 0)
-            .unwrap_or_else(|| chrono::Utc::now());
-
-        if !has_objects {
-            latest_upload_time = upload_time;
+        for object in objects {
+            let key = object.key;
+            let size = object.size;
+            let file_name = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
+            if file_name == "owner.txt"
+                || file_name == ".active"
+                || file_name == FINALIZED_MANIFEST_NAME
+                || file_name.starts_with(".multipart-")
+            {
+                continue;
+            }
             has_objects = true;
-        } else if upload_time > latest_upload_time {
-            latest_upload_time = upload_time;
+            if file_name == "metadata.enc" || thumbnail_file_id(&file_name).is_some() {
+                continue;
+            }
+            if payload_file_id(&file_name).is_some() {
+                files.push(ShareFile {
+                    name: file_name,
+                    size,
+                });
+            }
         }
-
-        // Hide internal artifacts (encrypted manifest, thumbnails) from the
-        // public file listing; viewers read the decrypted manifest instead.
-        if file_name == "metadata.enc" || file_name.ends_with(".thumb.enc") {
-            continue;
-        }
-
-        files.push(ShareFile {
-            name: file_name,
-            size,
-        });
     }
 
     if !has_objects {
@@ -1754,7 +2625,6 @@ async fn get_share(
         ));
     }
 
-    let owner_key = format!("uploads/{}/owner.txt", uuid);
     let owner_res = state
         .storage
         .get_object_bytes(&state.bucket, &owner_key)
@@ -1767,10 +2637,23 @@ async fn get_share(
             .to_string(),
         Err(_) => String::new(),
     };
+    if let Some(manifest) = &manifest {
+        if manifest.owner != owner {
+            return Err((
+                StatusCode::CONFLICT,
+                "Share ownership is invalid".to_string(),
+            ));
+        }
+    }
 
     let owner_pfp = None;
 
-    let expires_at = latest_upload_time + chrono::Duration::days(90);
+    let expires_at = manifest
+        .as_ref()
+        .and_then(|manifest| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp(manifest.expires_at, 0)
+        })
+        .unwrap_or_else(|| latest_upload_time + chrono::Duration::seconds(state.share_expiry_secs));
 
     Ok(axum::Json(ShareDetails {
         uuid,
@@ -1782,85 +2665,136 @@ async fn get_share(
     }))
 }
 
-// Download/stream a file from S3 share
-// Supports HTTP Range requests so that a Service Worker can fetch individual
-// encrypted chunks on demand for streaming preview of large media files.
-async fn download_file(
+async fn create_download_request(
+    state: &AppState,
+    uuid: &str,
+    filename: &str,
+) -> Result<(storage::PresignedRequest, u64), (StatusCode, String)> {
+    if !state.storage.supports_presigning() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Direct file transfers require an S3 bucket".to_string(),
+        ));
+    }
+    validate_upload_uuid(uuid)?;
+    if !is_valid_upload_filename(filename) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid share file path".to_string(),
+        ));
+    }
+
+    let owner_key = format!("uploads/{}/owner.txt", uuid);
+    let owner_info = state
+        .storage
+        .head_object_info(&state.bucket, &owner_key)
+        .await
+        .map_err(|error| {
+            tracing::error!("S3 HeadObject error for share owner: {}", error);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Share not found or expired".to_string(),
+            )
+        })?;
+    let now = chrono::Utc::now().timestamp();
+    let owner_expires_at = owner_info
+        .last_modified_secs
+        .saturating_add(state.share_expiry_secs);
+    if now >= owner_expires_at {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Share not found or expired".to_string(),
+        ));
+    }
+
+    let key = format!("uploads/{}/{}", uuid, filename);
+    let mut expires_at = owner_expires_at;
+    match load_finalized_manifest(state, uuid).await {
+        Ok(Some(manifest)) => {
+            expires_at = expires_at.min(manifest.expires_at);
+            if now >= expires_at || !manifest.files.contains_key(filename) {
+                return Err((StatusCode::NOT_FOUND, "File not found".to_string()));
+            }
+        }
+        Ok(None) => {
+            // Read-only compatibility for shares finalized before manifests existed.
+            match state.storage.head_object_info(&state.bucket, &key).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return Err((StatusCode::NOT_FOUND, "File not found".to_string())),
+                Err(error) => {
+                    tracing::error!("S3 HeadObject error for share file: {}", error);
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Internal server error".to_string(),
+                    ));
+                }
+            }
+        }
+        Err(error) => return Err(error),
+    }
+
+    let remaining_secs = expires_at.saturating_sub(now) as u64;
+    let presign_ttl =
+        std::time::Duration::from_secs(state.presign_ttl.as_secs().min(remaining_secs).max(1));
+
+    let request = state
+        .storage
+        .presign_get_object(&state.bucket, &key, presign_ttl)
+        .await
+        .map_err(|error| {
+            tracing::error!("Failed to presign S3 download: {}", error);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
+        })?;
+    Ok((request, presign_ttl.as_secs()))
+}
+
+async fn get_download_url(
     State(state): State<AppState>,
     Path((uuid, filename)): Path<(String, String)>,
-    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let (request, expires_in) = create_download_request(&state, &uuid, &filename).await?;
+    Ok(axum::Json(serde_json::json!({
+        "url": request.url,
+        "expires_in": expires_in
+    })))
+}
+
+// Range headers are retained by the 307, so file bytes never pass through this server.
+async fn download_file(
+    State(state): State<AppState>,
+    method: axum::http::Method,
+    Path((uuid, filename)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let key = format!("uploads/{}/{}", uuid, filename);
-
-    let raw_range_header = headers
-        .get(axum::http::header::RANGE)
-        .and_then(|v| v.to_str().ok().map(|s| s.to_string()));
-
-    let res = match state.storage.get_object(&state.bucket, &key, raw_range_header).await {
-        Ok(output) => output,
-        Err(e) => {
-            let (status, msg) = match &e {
-                storage::StorageError::NotFound(_) => {
-                    (StatusCode::NOT_FOUND, "File not found")
-                }
-                storage::StorageError::InvalidRange(_) => {
-                    (StatusCode::RANGE_NOT_SATISFIABLE, "Requested range not satisfiable")
-                }
-                storage::StorageError::Other(_) => {
-                    tracing::error!("S3 GetObject error: {:?}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
-                }
-            };
-            return Response::builder()
-                .status(status)
-                .header(axum::http::header::ACCEPT_RANGES, "bytes")
-                .body(Body::from(msg))
-                .unwrap();
-        }
+    if method != axum::http::Method::GET {
+        return (StatusCode::METHOD_NOT_ALLOWED, "Method not allowed").into_response();
+    }
+    let (request, _) = match create_download_request(&state, &uuid, &filename).await {
+        Ok(result) => result,
+        Err(error) => return error.into_response(),
     };
 
-    let body = res.body;
-
-    let status = if res.content_range.is_some() {
-        StatusCode::PARTIAL_CONTENT
-    } else {
-        StatusCode::OK
-    };
-    let mut builder = Response::builder().status(status);
-
-    if let Some(ref content_type) = res.content_type {
-        builder = builder.header(CONTENT_TYPE, content_type);
-    } else {
-        let guessed = mime_guess::from_path(&filename)
-            .first_or_octet_stream()
-            .to_string();
-        builder = builder.header(CONTENT_TYPE, guessed);
-    }
-
-    if let Some(content_length) = res.content_length {
-        builder = builder.header(CONTENT_LENGTH, content_length);
-    }
-
-    if let Some(content_range) = res.content_range {
-        builder = builder.header(
-            axum::http::header::CONTENT_RANGE,
-            content_range,
-        );
-    }
-
-    // Advertise range support so media engines will issue range requests.
-    builder = builder.header(axum::http::header::ACCEPT_RANGES, "bytes");
-
-    let encoded_filename =
-        percent_encoding::utf8_percent_encode(&filename, percent_encoding::NON_ALPHANUMERIC)
-            .to_string();
-
-    builder = builder.header(
-        CONTENT_DISPOSITION,
-        format!("inline; filename*=UTF-8''{}", encoded_filename),
-    );
-
-    builder.body(body).unwrap()
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(axum::http::header::LOCATION, request.url)
+        .header(
+            axum::http::header::CACHE_CONTROL,
+            "private, no-store, max-age=0",
+        )
+        .header("referrer-policy", "no-referrer")
+        .header("x-content-type-options", "nosniff")
+        .body(Body::empty())
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })
 }
 
 // Delete an entire share from S3
@@ -1948,19 +2882,34 @@ async fn remove_share_from_user_index(
         return;
     }
     let public_shares_key = format!("users/{}/public_shares.json", username);
-    if let Ok(bytes) = storage.get_object_bytes(bucket, &public_shares_key).await {
-        if let Ok(mut shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
-            shares.retain(|s| s.get("uuid").and_then(|u| u.as_str()) != Some(uuid));
-            if let Ok(shares_bytes) = serde_json::to_vec(&shares) {
-                let _ = storage
-                    .put_object(
-                        bucket,
-                        &public_shares_key,
-                        shares_bytes,
-                        Some("application/json"),
-                    )
-                    .await;
+    for _ in 0..8 {
+        match storage
+            .get_object_bytes_with_etag(bucket, &public_shares_key)
+            .await
+        {
+            Ok(Some((bytes, e_tag))) => {
+                if let Ok(mut shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
+                    shares.retain(|s| s.get("uuid").and_then(|u| u.as_str()) != Some(uuid));
+                    if let Ok(shares_bytes) = serde_json::to_vec(&shares) {
+                        match storage
+                            .put_object_if_match(
+                                bucket,
+                                &public_shares_key,
+                                shares_bytes,
+                                Some("application/json"),
+                                &e_tag,
+                            )
+                            .await
+                        {
+                            Ok(true) => return,
+                            Ok(false) => continue,
+                            Err(_) => return,
+                        }
+                    }
+                }
+                return;
             }
+            Ok(None) | Err(_) => return,
         }
     }
 }
@@ -1981,6 +2930,7 @@ async fn run_cleanup_worker(storage: storage::Storage, bucket: String) {
 
 struct ShareGroup {
     has_owner: bool,
+    owner_modified_secs: i64,
     latest_modified_secs: i64,
     keys: Vec<String>,
 }
@@ -1997,13 +2947,15 @@ async fn perform_cleanup(
     let share_expiry_days = std::env::var("DILLSHARE_EXPIRE_DAYS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(90);
+        .unwrap_or(90)
+        .clamp(1, 3650);
     let share_expire_limit = share_expiry_days * 24 * 60 * 60;
 
     let partial_timeout_hours = std::env::var("DILLSHARE_PARTIAL_TIMEOUT_HOURS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(12); // Default to 12 hours for incomplete / cancelled / abandoned uploads
+        .unwrap_or(12)
+        .clamp(1, 168); // Hard lifetime for incomplete uploads, regardless of heartbeats
     let partial_upload_limit = partial_timeout_hours * 60 * 60;
 
     let mut groups: std::collections::HashMap<String, ShareGroup> =
@@ -2017,6 +2969,26 @@ async fn perform_cleanup(
         for mp in multipart_uploads {
             let age = now - mp.initiated_secs;
             if age > partial_timeout_secs {
+                let active_key = mp
+                    .key
+                    .strip_prefix("uploads/")
+                    .and_then(|rest| rest.split_once('/'))
+                    .map(|(uuid, _)| format!("uploads/{}/.active", uuid));
+                if let Some(active_key) = active_key {
+                    if let Ok(Some(active)) = storage.head_object_info(bucket, &active_key).await {
+                        if now - active.last_modified_secs <= partial_timeout_secs {
+                            if let Ok(bytes) = storage.get_object_bytes(bucket, &active_key).await {
+                                if let Ok(marker) =
+                                    serde_json::from_slice::<ActiveUploadMarker>(&bytes)
+                                {
+                                    if now - marker.created_at <= partial_timeout_secs {
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 tracing::info!(
                     "Aborting stale multipart upload '{}' for key '{}' (age: {}s).",
                     mp.upload_id,
@@ -2045,12 +3017,14 @@ async fn perform_cleanup(
 
         let entry = groups.entry(uuid).or_insert_with(|| ShareGroup {
             has_owner: false,
+            owner_modified_secs: 0,
             latest_modified_secs: 0,
             keys: Vec::new(),
         });
 
         if rel.ends_with("/owner.txt") || rel == "owner.txt" {
             entry.has_owner = true;
+            entry.owner_modified_secs = mod_secs;
         }
         if mod_secs > entry.latest_modified_secs {
             entry.latest_modified_secs = mod_secs;
@@ -2062,8 +3036,8 @@ async fn perform_cleanup(
     let mut expired_share_uuids = Vec::new();
 
     for (uuid, group) in groups {
-        let age = now - group.latest_modified_secs;
         if group.has_owner {
+            let age = now - group.owner_modified_secs;
             if age > share_expire_limit {
                 tracing::info!(
                     "Completed share '{}' is older than {} days (age: {}s). Marking for deletion.",
@@ -2073,9 +3047,86 @@ async fn perform_cleanup(
                 );
                 keys_to_delete.extend(group.keys);
                 expired_share_uuids.push(uuid);
+            } else {
+                let manifest_key = format!("uploads/{}/{}", uuid, FINALIZED_MANIFEST_NAME);
+                if let Ok(bytes) = storage.get_object_bytes(bucket, &manifest_key).await {
+                    if let Ok(manifest) = serde_json::from_slice::<FinalizedShareManifest>(&bytes) {
+                        let prefix = format!("uploads/{}/", uuid);
+                        let mut allowed = std::collections::HashSet::new();
+                        allowed.insert(format!("{}owner.txt", prefix));
+                        allowed.insert(manifest_key);
+                        for file_name in manifest.files.keys() {
+                            allowed.insert(format!("{}{}", prefix, file_name));
+                        }
+                        keys_to_delete
+                            .extend(group.keys.into_iter().filter(|key| !allowed.contains(key)));
+                    }
+                }
             }
         } else {
+            let active_key = format!("uploads/{}/.active", uuid);
+            let owner_key = format!("uploads/{}/owner.txt", uuid);
+            match storage.head_object_info(bucket, &owner_key).await {
+                Ok(None) => {}
+                Ok(Some(_)) | Err(_) => continue,
+            }
+
+            let active_info = match storage.head_object_info(bucket, &active_key).await {
+                Ok(info) => info,
+                Err(_) => continue,
+            };
+            let mut created_at = group.latest_modified_secs;
+            if let Some(active_info) = active_info {
+                let bytes = match storage.get_object_bytes(bucket, &active_key).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                };
+                let mut marker = match serde_json::from_slice::<ActiveUploadMarker>(&bytes) {
+                    Ok(marker) => marker,
+                    Err(_) => continue,
+                };
+                created_at = marker.created_at;
+                if now - created_at <= partial_upload_limit {
+                    continue;
+                }
+                if marker.status == "finishing" {
+                    // A finisher already owns the CAS claim. Never delete from a
+                    // stale pre-owner listing while that operation may be running.
+                    continue;
+                }
+                if marker.status == "active" {
+                    let e_tag = match active_info.e_tag {
+                        Some(e_tag) => e_tag,
+                        None => continue,
+                    };
+                    marker.status = "cleaning".to_string();
+                    let marker_bytes = match serde_json::to_vec(&marker) {
+                        Ok(bytes) => bytes,
+                        Err(_) => continue,
+                    };
+                    match storage
+                        .put_object_if_match(
+                            bucket,
+                            &active_key,
+                            marker_bytes,
+                            Some("application/json"),
+                            &e_tag,
+                        )
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) | Err(_) => continue,
+                    }
+                } else if marker.status != "aborting" && marker.status != "cleaning" {
+                    continue;
+                }
+            }
+            let age = now - created_at;
             if age > partial_upload_limit {
+                match storage.head_object_info(bucket, &owner_key).await {
+                    Ok(None) => {}
+                    Ok(Some(_)) | Err(_) => continue,
+                }
                 tracing::info!("Partial/cancelled upload '{}' has no owner record and is inactive (age: {}s). Marking for cleanup.", uuid, age);
                 keys_to_delete.extend(group.keys);
             }
@@ -2097,7 +3148,10 @@ async fn perform_cleanup(
     }
 
     // Cleanup old auth sessions
-    if let Ok(sessions) = storage.list_objects(bucket, Some("auth_sessions/"), None).await {
+    if let Ok(sessions) = storage
+        .list_objects(bucket, Some("auth_sessions/"), None)
+        .await
+    {
         for session in sessions {
             if now - session.last_modified_secs > partial_upload_limit {
                 keys_to_delete.push(session.key);
@@ -2108,7 +3162,9 @@ async fn perform_cleanup(
     // Cleanup old user passkey states
     if let Ok(users) = storage.list_objects(bucket, Some("users/"), None).await {
         for object in users {
-            if object.key.ends_with("/passkey_reg.json") || object.key.ends_with("/passkey_auth.json") {
+            if object.key.ends_with("/passkey_reg.json")
+                || object.key.ends_with("/passkey_auth.json")
+            {
                 if now - object.last_modified_secs > partial_upload_limit {
                     keys_to_delete.push(object.key);
                 }
@@ -2117,18 +3173,27 @@ async fn perform_cleanup(
     }
 
     // Cleanup orphaned passkey indexes
-    if let Ok(indexes) = storage.list_objects(bucket, Some("passkey_index/"), None).await {
+    if let Ok(indexes) = storage
+        .list_objects(bucket, Some("passkey_index/"), None)
+        .await
+    {
         for index in indexes {
-            let cred_id_b64 = index.key.strip_prefix("passkey_index/").unwrap_or(&index.key);
+            let cred_id_b64 = index
+                .key
+                .strip_prefix("passkey_index/")
+                .unwrap_or(&index.key);
             let mut keep = false;
             if let Ok(bytes) = storage.get_object_bytes(bucket, &index.key).await {
                 if let Ok(username) = String::from_utf8(bytes.to_vec()) {
                     let passkeys_key = format!("users/{}/passkeys.json", username.trim());
                     if let Ok(pk_bytes) = storage.get_object_bytes(bucket, &passkeys_key).await {
-                        if let Ok(passkeys) = serde_json::from_slice::<Vec<webauthn_rs::prelude::Passkey>>(&pk_bytes) {
+                        if let Ok(passkeys) =
+                            serde_json::from_slice::<Vec<webauthn_rs::prelude::Passkey>>(&pk_bytes)
+                        {
                             use base64::Engine;
                             keep = passkeys.iter().any(|pk| {
-                                base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(pk.cred_id()) == cred_id_b64
+                                base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(pk.cred_id())
+                                    == cred_id_b64
                             });
                         }
                     }
@@ -2735,7 +3800,12 @@ async fn admin_get_stats(
 
         let total_size: i64 = shares
             .iter()
-            .map(|s| s.get("total_size").and_then(|sz| sz.as_i64()).unwrap_or(0))
+            .map(|s| {
+                s.get("stored_size")
+                    .or_else(|| s.get("total_size"))
+                    .and_then(|size| size.as_i64())
+                    .unwrap_or(0)
+            })
             .sum();
 
         stats.push(serde_json::json!({
@@ -4115,4 +5185,122 @@ async fn disable_2fa(
         })?;
 
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_generated_share_object_names_are_accepted() {
+        for valid in [
+            "metadata.enc",
+            "file_0.enc",
+            "file_42.enc",
+            "file_0.thumb.enc",
+        ] {
+            assert!(is_valid_upload_filename(valid), "{valid}");
+        }
+        for invalid in [
+            "owner.txt",
+            ".active",
+            ".manifest.json",
+            "file_00.enc",
+            "file_-1.enc",
+            "file_1/../../owner.txt",
+            "file_1.thumb.enc/extra",
+            "metadata.enc.bak",
+        ] {
+            assert!(!is_valid_upload_filename(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn encrypted_sizes_match_the_browser_chunk_format() {
+        assert_eq!(encrypted_file_size(0), Some(28));
+        assert_eq!(encrypted_file_size(1), Some(29));
+        assert_eq!(
+            encrypted_file_size(ENCRYPTION_CHUNK_BYTES),
+            Some(ENCRYPTION_CHUNK_BYTES + 28)
+        );
+        assert_eq!(
+            encrypted_file_size(ENCRYPTION_CHUNK_BYTES + 1),
+            Some(ENCRYPTION_CHUNK_BYTES + 1 + 56)
+        );
+        assert_eq!(encrypted_file_size(-1), None);
+    }
+
+    #[test]
+    fn multipart_layout_matches_the_browser_pipeline() {
+        let plaintext_size = 2 * ENCRYPTION_CHUNK_BYTES + 1;
+        let parts = multipart_part_sizes(plaintext_size).unwrap();
+        assert_eq!(parts, vec![2 * (ENCRYPTION_CHUNK_BYTES + 28), 29]);
+        assert_eq!(
+            parts.iter().sum::<i64>(),
+            encrypted_file_size(plaintext_size).unwrap()
+        );
+    }
+
+    #[test]
+    fn sha256_checksum_must_decode_to_exactly_32_bytes() {
+        let valid = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 31]);
+        assert!(is_valid_sha256_checksum(&valid));
+        assert!(!is_valid_sha256_checksum(&short));
+        assert!(!is_valid_sha256_checksum("not base64"));
+    }
+
+    #[test]
+    fn upload_ids_must_be_canonical_uuids() {
+        let id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        assert!(validate_upload_uuid(&id).is_ok());
+        assert!(validate_upload_uuid(&id.to_uppercase()).is_err());
+        assert!(validate_upload_uuid("../another-share").is_err());
+    }
+
+    #[tokio::test]
+    async fn only_finish_authorization_can_resume_a_finishing_upload() {
+        let storage = storage::Storage::Memory(std::sync::Arc::new(tokio::sync::Mutex::new(
+            storage::MemoryBackend::default(),
+        )));
+        let rp_origin = webauthn_rs::prelude::Url::parse("http://localhost:3000").unwrap();
+        let webauthn = std::sync::Arc::new(
+            webauthn_rs::WebauthnBuilder::new("localhost", &rp_origin)
+                .unwrap()
+                .rp_name("DillShare")
+                .build()
+                .unwrap(),
+        );
+        let state = AppState {
+            storage,
+            bucket: "test".to_string(),
+            jwt_secret: vec![],
+            webauthn,
+            presign_ttl: std::time::Duration::from_secs(60),
+            share_expiry_secs: 3600,
+            upload_session_max_secs: 3600,
+            max_share_bytes: 1024 * 1024,
+        };
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        write_active_upload_marker(
+            &state,
+            uuid,
+            &ActiveUploadMarker {
+                owner: "alice".to_string(),
+                created_at: chrono::Utc::now().timestamp(),
+                file_sizes: vec![1],
+                status: "finishing".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(authorize_active_upload(&state, uuid, "alice")
+            .await
+            .is_err());
+        let marker = authorize_upload_marker(&state, uuid, "alice", Some("finishing"))
+            .await
+            .unwrap();
+        assert_eq!(marker.status, "finishing");
+    }
 }
