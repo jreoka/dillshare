@@ -1091,6 +1091,10 @@ const DIRECT_PUT_MAX_BYTES: i64 = 16 * 1024 * 1024;
 const S3_PART_MAX_BYTES: i64 = 5 * 1024 * 1024 * 1024;
 const ENCRYPTION_CHUNK_BYTES: i64 = 4 * 1024 * 1024;
 const ENCRYPTION_OVERHEAD_BYTES: i64 = 28;
+// Keep browser-side multipart buffers small. Each part normally contains two
+// encrypted chunks (about 8 MiB); only extremely large files increase this to
+// stay below S3's 10,000-part limit.
+const MULTIPART_CHUNKS_PER_PART: usize = 2;
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 const MAX_FILES_PER_SHARE: usize = 1_000;
 const METADATA_MAX_BYTES: i64 = 8 * 1024 * 1024;
@@ -1201,14 +1205,7 @@ fn multipart_part_sizes(plaintext_size: i64) -> Option<Vec<i64>> {
         )
         .ok()?
     };
-    let mut chunks_per_part = if plaintext_size >= 256 * 1024 * 1024 {
-        8usize
-    } else if plaintext_size >= 64 * 1024 * 1024 {
-        4usize
-    } else {
-        2usize
-    };
-    chunks_per_part = chunks_per_part.max(total_chunks.div_ceil(9_000));
+    let chunks_per_part = MULTIPART_CHUNKS_PER_PART.max(total_chunks.div_ceil(9_000));
 
     let mut sizes = Vec::with_capacity(total_chunks.div_ceil(chunks_per_part));
     for start_chunk in (0..total_chunks).step_by(chunks_per_part) {
@@ -5449,6 +5446,18 @@ mod tests {
         assert_eq!(
             parts.iter().sum::<i64>(),
             encrypted_file_size(plaintext_size).unwrap()
+        );
+
+        // A large upload must not silently switch to huge browser buffers.
+        let large_plaintext_size = 660 * 1024 * 1024;
+        let large_parts = multipart_part_sizes(large_plaintext_size).unwrap();
+        assert_eq!(large_parts.len(), 83);
+        assert!(large_parts[..large_parts.len() - 1]
+            .iter()
+            .all(|size| *size == 2 * (ENCRYPTION_CHUNK_BYTES + 28)));
+        assert_eq!(
+            large_parts.iter().sum::<i64>(),
+            encrypted_file_size(large_plaintext_size).unwrap()
         );
     }
 
