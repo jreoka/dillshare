@@ -74,9 +74,7 @@ struct AppState {
     jwt_secret: Vec<u8>,
     webauthn: std::sync::Arc<webauthn_rs::Webauthn>,
     presign_ttl: std::time::Duration,
-    share_expiry_secs: i64,
     upload_session_max_secs: i64,
-    max_share_bytes: i64,
     session_revocations: tokio::sync::broadcast::Sender<String>,
 }
 
@@ -173,22 +171,11 @@ async fn main() {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(300)
         .clamp(60, 900);
-    let share_expiry_days = std::env::var("DILLSHARE_EXPIRE_DAYS")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(90)
-        .clamp(1, 3650);
     let upload_session_max_hours = std::env::var("DILLSHARE_PARTIAL_TIMEOUT_HOURS")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(12)
         .clamp(1, 168);
-    let max_share_bytes = std::env::var("DILLSHARE_MAX_SHARE_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(100 * 1024 * 1024 * 1024)
-        .clamp(1024 * 1024, 5 * 1024 * 1024 * 1024 * 1024);
-
     let (session_revocations, _) = tokio::sync::broadcast::channel(1024);
     let state = AppState {
         storage: storage.clone(),
@@ -196,9 +183,7 @@ async fn main() {
         jwt_secret,
         webauthn,
         presign_ttl: std::time::Duration::from_secs(presign_ttl_secs),
-        share_expiry_secs: share_expiry_days * 24 * 60 * 60,
         upload_session_max_secs: upload_session_max_hours * 60 * 60,
-        max_share_bytes,
         session_revocations,
     };
 
@@ -1011,17 +996,8 @@ async fn api_not_found() -> impl IntoResponse {
 }
 
 // Serve the embedded SPA without caching HTML across binary upgrades.
-async fn serve_index(State(state): State<AppState>) -> impl IntoResponse {
-    let share_expiry_days = state.share_expiry_secs / (24 * 60 * 60);
-    let html = include_str!("index.html")
-        .replace(
-            "__DILLSHARE_SHARE_EXPIRY_DAYS__",
-            &share_expiry_days.to_string(),
-        )
-        .replace(
-            "__DILLSHARE_MAX_SHARE_BYTES__",
-            &state.max_share_bytes.to_string(),
-        );
+async fn serve_index() -> impl IntoResponse {
+    let html = include_str!("index.html");
     (
         [
             (axum::http::header::CACHE_CONTROL, "no-cache"),
@@ -1115,6 +1091,7 @@ const DIRECT_PUT_MAX_BYTES: i64 = 16 * 1024 * 1024;
 const S3_PART_MAX_BYTES: i64 = 5 * 1024 * 1024 * 1024;
 const ENCRYPTION_CHUNK_BYTES: i64 = 4 * 1024 * 1024;
 const ENCRYPTION_OVERHEAD_BYTES: i64 = 28;
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 const MAX_FILES_PER_SHARE: usize = 1_000;
 const METADATA_MAX_BYTES: i64 = 8 * 1024 * 1024;
 const THUMBNAIL_MAX_BYTES: i64 = 2 * 1024 * 1024;
@@ -1196,6 +1173,23 @@ fn encrypted_file_size(plaintext_size: i64) -> Option<i64> {
         plaintext_size.checked_add(ENCRYPTION_CHUNK_BYTES - 1)? / ENCRYPTION_CHUNK_BYTES
     };
     plaintext_size.checked_add(chunks.checked_mul(ENCRYPTION_OVERHEAD_BYTES)?)
+}
+
+fn expiration_timestamp(start_timestamp: i64, expiry_days: i64) -> Option<i64> {
+    if expiry_days <= 0 {
+        return None;
+    }
+    let timestamp = start_timestamp.checked_add(expiry_days.checked_mul(SECONDS_PER_DAY)?)?;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0).map(|_| timestamp)
+}
+
+fn parse_expiry_days(value: &str, start_timestamp: i64) -> Option<i64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let days = value.parse::<i64>().ok()?;
+    expiration_timestamp(start_timestamp, days)?;
+    Some(days)
 }
 
 fn multipart_part_sizes(plaintext_size: i64) -> Option<Vec<i64>> {
@@ -1284,6 +1278,7 @@ fn validate_upload_uuid(value: &str) -> Result<(), (StatusCode, String)> {
 struct ActiveUploadMarker {
     owner: String,
     created_at: i64,
+    expiry_days: i64,
     file_sizes: Vec<i64>,
     status: String,
 }
@@ -1485,6 +1480,7 @@ async fn claim_active_upload(
 #[derive(serde::Deserialize)]
 struct UploadInitReq {
     file_sizes: Vec<i64>,
+    expiry_days: String,
 }
 
 async fn upload_init(
@@ -1515,30 +1511,25 @@ async fn upload_init(
             ),
         ));
     }
-    let mut expected_payload_bytes = 0i64;
     for size in &payload.file_sizes {
-        let encrypted_size = encrypted_file_size(*size)
+        encrypted_file_size(*size)
             .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid file size".to_string()))?;
-        expected_payload_bytes = expected_payload_bytes
-            .checked_add(encrypted_size)
-            .ok_or_else(|| {
-                (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "Share is too large".to_string(),
-                )
-            })?;
     }
-    if expected_payload_bytes > state.max_share_bytes {
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Share exceeds the configured storage limit".to_string(),
-        ));
-    }
+
+    let created_at = chrono::Utc::now().timestamp();
+    let expiry_days = parse_expiry_days(&payload.expiry_days, created_at).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Expiration days must be a positive whole number within the supported date range"
+                .to_string(),
+        )
+    })?;
 
     let uuid = uuid::Uuid::new_v4().to_string();
     let marker = ActiveUploadMarker {
         owner: username,
-        created_at: chrono::Utc::now().timestamp(),
+        created_at,
+        expiry_days,
         file_sizes: payload.file_sizes,
         status: "active".to_string(),
     };
@@ -1999,15 +1990,17 @@ async fn upload_finish(
         }
     }
 
-    if stored_size > state.max_share_bytes {
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Share exceeds the configured storage limit".to_string(),
-        ));
-    }
+    let finished_at = chrono::Utc::now().timestamp();
+    let expires_at = expiration_timestamp(finished_at, marker.expiry_days).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Expiration days are outside the supported date range".to_string(),
+        )
+    })?;
 
     let claimed_marker = claim_active_upload(&state, &uuid, &username, "finishing").await?;
     if claimed_marker.created_at != marker.created_at
+        || claimed_marker.expiry_days != marker.expiry_days
         || claimed_marker.file_sizes != marker.file_sizes
     {
         return Err((
@@ -2016,12 +2009,11 @@ async fn upload_finish(
         ));
     }
 
-    let finished_at = chrono::Utc::now().timestamp();
     let manifest = FinalizedShareManifest {
         version: 1,
         owner: username.clone(),
         created_at: marker.created_at,
-        expires_at: finished_at.saturating_add(state.share_expiry_secs),
+        expires_at,
         plaintext_size: payload.total_size,
         stored_size,
         files: manifest_files,
@@ -2676,7 +2668,6 @@ async fn get_share(
     Path(uuid): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_upload_uuid(&uuid)?;
-    let prefix = format!("uploads/{}/", uuid);
     let owner_key = format!("uploads/{}/owner.txt", uuid);
     let owner_info = state
         .storage
@@ -2689,8 +2680,16 @@ async fn get_share(
                 "Share not found or expired".to_string(),
             )
         })?;
+    let manifest = load_finalized_manifest(&state, &uuid)
+        .await?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Share not found or expired".to_string(),
+            )
+        })?;
     let now = chrono::Utc::now().timestamp();
-    if now.saturating_sub(owner_info.last_modified_secs) > state.share_expiry_secs {
+    if manifest.expires_at <= now || !manifest.files.contains_key("metadata.enc") {
         return Err((
             StatusCode::NOT_FOUND,
             "Share not found or expired".to_string(),
@@ -2713,105 +2712,50 @@ async fn get_share(
         owner_pfp: Option<String>,
     }
 
-    let mut files = Vec::new();
-    let latest_upload_time =
+    let files = manifest
+        .files
+        .iter()
+        .filter(|(file_name, _)| payload_file_id(file_name).is_some())
+        .map(|(file_name, size)| ShareFile {
+            name: file_name.clone(),
+            size: *size,
+        })
+        .collect();
+    let upload_time =
         chrono::DateTime::<chrono::Utc>::from_timestamp(owner_info.last_modified_secs, 0)
             .unwrap_or_else(chrono::Utc::now);
-    let mut has_objects = false;
-    let manifest = load_finalized_manifest(&state, &uuid).await?;
-
-    if let Some(manifest) = &manifest {
-        if manifest.expires_at <= now {
-            return Err((
-                StatusCode::NOT_FOUND,
-                "Share not found or expired".to_string(),
-            ));
-        }
-        has_objects = manifest.files.contains_key("metadata.enc");
-        for (file_name, size) in &manifest.files {
-            if payload_file_id(file_name).is_some() {
-                files.push(ShareFile {
-                    name: file_name.clone(),
-                    size: *size,
-                });
-            }
-        }
-    } else {
-        // Read-only compatibility for shares finalized before manifests existed.
-        let objects = state
-            .storage
-            .list_objects(&state.bucket, Some(&prefix), None)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-        for object in objects {
-            let key = object.key;
-            let size = object.size;
-            let file_name = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
-            if file_name == "owner.txt"
-                || file_name == ".active"
-                || file_name == FINALIZED_MANIFEST_NAME
-                || file_name.starts_with(".multipart-")
-            {
-                continue;
-            }
-            has_objects = true;
-            if file_name == "metadata.enc" || thumbnail_file_id(&file_name).is_some() {
-                continue;
-            }
-            if payload_file_id(&file_name).is_some() {
-                files.push(ShareFile {
-                    name: file_name,
-                    size,
-                });
-            }
-        }
-    }
-
-    if !has_objects {
+    let expires_at = chrono::DateTime::<chrono::Utc>::from_timestamp(manifest.expires_at, 0)
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                "Share expiration is invalid".to_string(),
+            )
+        })?;
+    let owner = state
+        .storage
+        .get_object_bytes(&state.bucket, &owner_key)
+        .await
+        .map(|bytes| {
+            String::from_utf8(bytes)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default();
+    if manifest.owner != owner {
         return Err((
-            StatusCode::NOT_FOUND,
-            "Share not found or expired".to_string(),
+            StatusCode::CONFLICT,
+            "Share ownership is invalid".to_string(),
         ));
     }
 
-    let owner_res = state
-        .storage
-        .get_object_bytes(&state.bucket, &owner_key)
-        .await;
-
-    let owner = match owner_res {
-        Ok(bytes) => String::from_utf8(bytes)
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
-        Err(_) => String::new(),
-    };
-    if let Some(manifest) = &manifest {
-        if manifest.owner != owner {
-            return Err((
-                StatusCode::CONFLICT,
-                "Share ownership is invalid".to_string(),
-            ));
-        }
-    }
-
-    let owner_pfp = None;
-
-    let expires_at = manifest
-        .as_ref()
-        .and_then(|manifest| {
-            chrono::DateTime::<chrono::Utc>::from_timestamp(manifest.expires_at, 0)
-        })
-        .unwrap_or_else(|| latest_upload_time + chrono::Duration::seconds(state.share_expiry_secs));
-
     Ok(axum::Json(ShareDetails {
         uuid,
-        upload_time: latest_upload_time,
+        upload_time,
         expires_at,
         files,
         owner,
-        owner_pfp,
+        owner_pfp: None,
     }))
 }
 
@@ -2835,7 +2779,7 @@ async fn create_download_request(
     }
 
     let owner_key = format!("uploads/{}/owner.txt", uuid);
-    let owner_info = state
+    if state
         .storage
         .head_object_info(&state.bucket, &owner_key)
         .await
@@ -2846,50 +2790,27 @@ async fn create_download_request(
                 "Internal server error".to_string(),
             )
         })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                "Share not found or expired".to_string(),
-            )
-        })?;
-    let now = chrono::Utc::now().timestamp();
-    let owner_expires_at = owner_info
-        .last_modified_secs
-        .saturating_add(state.share_expiry_secs);
-    if now >= owner_expires_at {
+        .is_none()
+    {
         return Err((
             StatusCode::NOT_FOUND,
             "Share not found or expired".to_string(),
         ));
     }
 
-    let key = format!("uploads/{}/{}", uuid, filename);
-    let mut expires_at = owner_expires_at;
-    match load_finalized_manifest(state, uuid).await {
-        Ok(Some(manifest)) => {
-            expires_at = expires_at.min(manifest.expires_at);
-            if now >= expires_at || !manifest.files.contains_key(filename) {
-                return Err((StatusCode::NOT_FOUND, "File not found".to_string()));
-            }
-        }
-        Ok(None) => {
-            // Read-only compatibility for shares finalized before manifests existed.
-            match state.storage.head_object_info(&state.bucket, &key).await {
-                Ok(Some(_)) => {}
-                Ok(None) => return Err((StatusCode::NOT_FOUND, "File not found".to_string())),
-                Err(error) => {
-                    tracing::error!("S3 HeadObject error for share file: {}", error);
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Internal server error".to_string(),
-                    ));
-                }
-            }
-        }
-        Err(error) => return Err(error),
+    let manifest = load_finalized_manifest(state, uuid).await?.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "Share not found or expired".to_string(),
+        )
+    })?;
+    let now = chrono::Utc::now().timestamp();
+    if now >= manifest.expires_at || !manifest.files.contains_key(filename) {
+        return Err((StatusCode::NOT_FOUND, "File not found".to_string()));
     }
 
-    let remaining_secs = expires_at.saturating_sub(now) as u64;
+    let key = format!("uploads/{}/{}", uuid, filename);
+    let remaining_secs = manifest.expires_at.saturating_sub(now) as u64;
     let presign_ttl =
         std::time::Duration::from_secs(state.presign_ttl.as_secs().min(remaining_secs).max(1));
 
@@ -3057,7 +2978,7 @@ async fn remove_share_from_user_index(
     }
 }
 
-// Background cleanup worker - deletes objects using the configured share and partial-upload lifetimes.
+// Background cleanup worker deletes expired shares and abandoned partial uploads.
 async fn run_cleanup_worker(storage: storage::Storage, bucket: String) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // check every hour
     loop {
@@ -3073,7 +2994,6 @@ async fn run_cleanup_worker(storage: storage::Storage, bucket: String) {
 
 struct ShareGroup {
     has_owner: bool,
-    owner_modified_secs: i64,
     latest_modified_secs: i64,
     keys: Vec<String>,
 }
@@ -3083,13 +3003,6 @@ async fn perform_cleanup(
     bucket: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let now = chrono::Utc::now().timestamp();
-
-    let share_expiry_days = std::env::var("DILLSHARE_EXPIRE_DAYS")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(90)
-        .clamp(1, 3650);
-    let share_expire_limit = share_expiry_days * 24 * 60 * 60;
 
     let partial_timeout_hours = std::env::var("DILLSHARE_PARTIAL_TIMEOUT_HOURS")
         .ok()
@@ -3157,14 +3070,12 @@ async fn perform_cleanup(
 
         let entry = groups.entry(uuid).or_insert_with(|| ShareGroup {
             has_owner: false,
-            owner_modified_secs: 0,
             latest_modified_secs: 0,
             keys: Vec::new(),
         });
 
         if rel.ends_with("/owner.txt") || rel == "owner.txt" {
             entry.has_owner = true;
-            entry.owner_modified_secs = mod_secs;
         }
         if mod_secs > entry.latest_modified_secs {
             entry.latest_modified_secs = mod_secs;
@@ -3177,31 +3088,67 @@ async fn perform_cleanup(
 
     for (uuid, group) in groups {
         if group.has_owner {
-            let age = now - group.owner_modified_secs;
-            if age > share_expire_limit {
+            let manifest_key = format!("uploads/{}/{}", uuid, FINALIZED_MANIFEST_NAME);
+            let manifest = match storage.head_object_info(bucket, &manifest_key).await {
+                Ok(None) => {
+                    tracing::warn!(
+                        "Completed share '{}' has no expiration manifest. Marking for deletion.",
+                        uuid
+                    );
+                    keys_to_delete.extend(group.keys);
+                    expired_share_uuids.push(uuid);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Could not inspect expiration manifest for share '{}': {}",
+                        uuid,
+                        error
+                    );
+                    continue;
+                }
+                Ok(Some(_)) => match storage.get_object_bytes(bucket, &manifest_key).await {
+                    Ok(bytes) => match serde_json::from_slice::<FinalizedShareManifest>(&bytes) {
+                        Ok(manifest) => manifest,
+                        Err(error) => {
+                            tracing::warn!(
+                                "Completed share '{}' has an invalid expiration manifest: {}. Marking for deletion.",
+                                uuid,
+                                error
+                            );
+                            keys_to_delete.extend(group.keys);
+                            expired_share_uuids.push(uuid);
+                            continue;
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            "Could not read expiration manifest for share '{}': {}",
+                            uuid,
+                            error
+                        );
+                        continue;
+                    }
+                },
+            };
+
+            if manifest.expires_at <= now {
                 tracing::info!(
-                    "Completed share '{}' is older than {} days (age: {}s). Marking for deletion.",
+                    "Completed share '{}' expired at timestamp {}. Marking for deletion.",
                     uuid,
-                    share_expiry_days,
-                    age
+                    manifest.expires_at
                 );
                 keys_to_delete.extend(group.keys);
                 expired_share_uuids.push(uuid);
             } else {
-                let manifest_key = format!("uploads/{}/{}", uuid, FINALIZED_MANIFEST_NAME);
-                if let Ok(bytes) = storage.get_object_bytes(bucket, &manifest_key).await {
-                    if let Ok(manifest) = serde_json::from_slice::<FinalizedShareManifest>(&bytes) {
-                        let prefix = format!("uploads/{}/", uuid);
-                        let mut allowed = std::collections::HashSet::new();
-                        allowed.insert(format!("{}owner.txt", prefix));
-                        allowed.insert(manifest_key);
-                        for file_name in manifest.files.keys() {
-                            allowed.insert(format!("{}{}", prefix, file_name));
-                        }
-                        keys_to_delete
-                            .extend(group.keys.into_iter().filter(|key| !allowed.contains(key)));
-                    }
+                let prefix = format!("uploads/{}/", uuid);
+                let mut allowed = std::collections::HashSet::new();
+                allowed.insert(format!("{}owner.txt", prefix));
+                allowed.insert(manifest_key);
+                for file_name in manifest.files.keys() {
+                    allowed.insert(format!("{}{}", prefix, file_name));
                 }
+                keys_to_delete.extend(group.keys.into_iter().filter(|key| !allowed.contains(key)));
             }
         } else {
             let active_key = format!("uploads/{}/.active", uuid);
@@ -5479,6 +5426,22 @@ mod tests {
     }
 
     #[test]
+    fn expiry_days_must_be_positive_whole_numbers() {
+        let start = 1_700_000_000;
+        assert_eq!(parse_expiry_days("1", start), Some(1));
+        assert_eq!(parse_expiry_days("0002", start), Some(2));
+        assert_eq!(
+            expiration_timestamp(start, 2),
+            Some(start + 2 * SECONDS_PER_DAY)
+        );
+        assert_eq!(parse_expiry_days("0", start), None);
+        assert_eq!(parse_expiry_days("-1", start), None);
+        assert_eq!(parse_expiry_days("1.5", start), None);
+        assert_eq!(parse_expiry_days("", start), None);
+        assert_eq!(parse_expiry_days(&i64::MAX.to_string(), start), None);
+    }
+
+    #[test]
     fn multipart_layout_matches_the_browser_pipeline() {
         let plaintext_size = 2 * ENCRYPTION_CHUNK_BYTES + 1;
         let parts = multipart_part_sizes(plaintext_size).unwrap();
@@ -5577,9 +5540,7 @@ mod tests {
             jwt_secret: vec![],
             webauthn,
             presign_ttl: std::time::Duration::from_secs(60),
-            share_expiry_secs: 3600,
             upload_session_max_secs: 3600,
-            max_share_bytes: 1024 * 1024,
             session_revocations: tokio::sync::broadcast::channel(16).0,
         };
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
@@ -5589,6 +5550,7 @@ mod tests {
             &ActiveUploadMarker {
                 owner: "alice".to_string(),
                 created_at: chrono::Utc::now().timestamp(),
+                expiry_days: 1,
                 file_sizes: vec![1],
                 status: "finishing".to_string(),
             },

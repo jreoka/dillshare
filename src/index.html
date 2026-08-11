@@ -1241,7 +1241,12 @@
                 <div class="files-list" id="selected-files-list">
                     <!-- Dynamic Rows -->
                 </div>
-                <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--surface-border);">
+                <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--surface-border); display: flex; flex-direction: column; gap: 1rem;">
+                    <div>
+                        <label for="expiry-days-input" style="display: block; font-size: 0.85rem; font-weight: 600; color: var(--text-main); margin-bottom: 0.35rem;">Expiration (Days)</label>
+                        <input type="text" id="expiry-days-input" inputmode="numeric" autocomplete="off" placeholder="Enter a positive whole number" style="width: 100%; box-sizing: border-box; font-family: inherit; background: var(--surface-color); border: 1px solid var(--surface-border); border-radius: 6px; padding: 0.6rem 0.75rem; color: var(--text-main); font-size: 0.85rem; outline: none;">
+                    </div>
+                    <div>
                     <div style="display: flex; justify-content: space-between; font-size: 0.85rem; font-weight: 600; color: var(--text-main); margin-bottom: 0.35rem;">
                         <span>Share Message (Optional, Encrypted, Markdown Supported)</span>
                         <span id="message-char-count" style="color: var(--text-muted); font-weight: normal;">0 / 4000</span>
@@ -1249,6 +1254,7 @@
                     <textarea id="share-message-input" maxlength="4000" rows="3" class="input-field" 
                               placeholder="Add a private note or markdown message for recipients (max 4000 chars)..." 
                               style="width: 100%; resize: vertical; box-sizing: border-box; font-family: inherit; background: var(--surface-color); border: 1px solid var(--surface-border); border-radius: 6px; padding: 0.6rem 0.75rem; color: var(--text-main); font-size: 0.85rem; outline: none;"></textarea>
+                    </div>
                 </div>
                 <div class="btn-group" style="justify-content: flex-end; margin-top: 1rem;">
                     <button class="btn btn-secondary" id="btn-clear-files">Clear</button>
@@ -1701,9 +1707,6 @@
     <div class="toast-container" id="toast-container"></div>
 
     <script>
-        const SHARE_EXPIRY_DAYS = __DILLSHARE_SHARE_EXPIRY_DAYS__;
-        const MAX_SHARE_BYTES = __DILLSHARE_MAX_SHARE_BYTES__;
-
         function bufferToBase64url(buffer) {
             const bytes = new Uint8Array(buffer);
             let str = '';
@@ -1762,6 +1765,7 @@
         const totalSizeBadge = document.getElementById('total-size-badge');
         const btnClearFiles = document.getElementById('btn-clear-files');
         const btnUpload = document.getElementById('btn-upload');
+        const expiryDaysInput = document.getElementById('expiry-days-input');
 
         const uploadProgressCard = document.getElementById('upload-progress-card');
         const uploadProgressTitle = document.getElementById('upload-progress-title');
@@ -3375,6 +3379,7 @@
 
         btnClearFiles.addEventListener('click', () => {
             selectedFiles = [];
+            if (expiryDaysInput) expiryDaysInput.value = '';
             if (shareMsgInput) {
                 shareMsgInput.value = '';
                 if (msgCharCount) msgCharCount.textContent = '0 / 4000';
@@ -3563,6 +3568,13 @@
         btnUpload.addEventListener('click', async () => {
             if (selectedFiles.length === 0) return;
 
+            const expiryDays = expiryDaysInput ? expiryDaysInput.value.trim() : '';
+            if (!/^\d+$/.test(expiryDays) || /^0+$/.test(expiryDays)) {
+                showToast('Expiration days must be a positive whole number.', 'error');
+                if (expiryDaysInput) expiryDaysInput.focus();
+                return;
+            }
+
             const shareMsgVal = shareMsgInput ? shareMsgInput.value.trim() : '';
             if (shareMsgVal.length > 4000) {
                 showToast('Share message cannot exceed 4000 characters.', 'error');
@@ -3596,7 +3608,10 @@
                 const initRes = await fetch('/api/upload/init', {
                     method: 'POST',
                     headers: initHeaders,
-                    body: JSON.stringify({ file_sizes: selectedFiles.map(item => item.file.size) })
+                    body: JSON.stringify({
+                        file_sizes: selectedFiles.map(item => item.file.size),
+                        expiry_days: expiryDays
+                    })
                 });
                 if (!initRes.ok) {
                     if (initRes.status === 401) logoutUser();
@@ -4031,6 +4046,7 @@
                     dropZone.style.pointerEvents = 'auto';
                     dropZone.style.opacity = '1';
                     selectedFiles = [];
+                    if (expiryDaysInput) expiryDaysInput.value = '';
                     if (shareMsgInput) {
                         shareMsgInput.value = '';
                         if (msgCharCount) msgCharCount.textContent = '0 / 4000';
@@ -4079,6 +4095,7 @@
         btnNewUpload.addEventListener('click', () => {
             shareResultCard.style.display = 'none';
             selectedFiles = [];
+            if (expiryDaysInput) expiryDaysInput.value = '';
             updateSelectedFilesUI();
         });
 
@@ -5810,8 +5827,10 @@
                 btnViewCreatedShare.onclick = null;
             }
             selectedFiles = [];
+            const expiryDaysInput = document.getElementById('expiry-days-input');
             const shareMsgInput = document.getElementById('share-message-input');
             const msgCharCount = document.getElementById('message-char-count');
+            if (expiryDaysInput) expiryDaysInput.value = '';
             if (shareMsgInput) {
                 shareMsgInput.value = '';
                 if (msgCharCount) msgCharCount.textContent = '0 / 4000';
@@ -6284,8 +6303,7 @@
                 uploadBtnGroup.style.display = 'flex';
                 authPrompt.style.display = 'none';
                 uploadTitle.textContent = 'Drag & Drop Files or Folders';
-                const expiryUnit = SHARE_EXPIRY_DAYS === 1 ? 'day' : 'days';
-                uploadDesc.textContent = `Files are uploaded securely and self-delete after ${SHARE_EXPIRY_DAYS} ${expiryUnit}. Maximum share size: ${formatBytes(MAX_SHARE_BYTES)}.`;
+                uploadDesc.textContent = 'Files are uploaded securely and expire after the number of days you choose.';
                 uploadDesc.style.color = '';
                 uploadDesc.style.fontWeight = '';
                 dropZoneCard.style.cursor = 'pointer';
