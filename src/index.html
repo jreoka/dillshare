@@ -1816,12 +1816,14 @@
         }
 
         function hexToBuf(hexString) {
-            if (!hexString || hexString.length % 2 !== 0) return null;
-            const badBytes = new Uint8Array(hexString.length / 2);
-            for (let i = 0; i < badBytes.length; i++) {
-                badBytes[i] = parseInt(hexString.substr(i * 2, 2), 16);
+            if (typeof hexString !== 'string' || !hexString || hexString.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(hexString)) {
+                return null;
             }
-            return badBytes.buffer;
+            const bytes = new Uint8Array(hexString.length / 2);
+            for (let i = 0; i < bytes.length; i++) {
+                bytes[i] = parseInt(hexString.slice(i * 2, i * 2 + 2), 16);
+            }
+            return bytes.buffer;
         }
 
         async function generateEncryptionKey() {
@@ -1863,7 +1865,6 @@
             const d = event.data;
             if (!d) return;
             if (d.type === 'DILL_SW_ACTIVE') {
-                console.log('[dill-sw] Got DILL_SW_ACTIVE. controller =', !!navigator.serviceWorker.controller);
                 // The SW just activated and claimed clients. Force a controller
                 // re-check for any in-flight ensureStreamingSW() waiters.
                 if (navigator.serviceWorker.controller) {
@@ -1872,7 +1873,6 @@
                 return;
             }
             if (d.type === 'DILL_PREVIEW_READY' && pendingStreamInits.has(d.streamPath)) {
-                console.log('[dill-sw] Preview ready for', d.streamPath);
                 const { resolve, reject } = pendingStreamInits.get(d.streamPath);
                 pendingStreamInits.delete(d.streamPath);
                 if (d.error) reject(new Error(d.error));
@@ -1891,11 +1891,9 @@
             }
             swControllerPromise = (async () => {
                 try {
-                    const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
-                    console.log('[dill-sw] registered. controller =', !!navigator.serviceWorker.controller, 'scope =', reg.scope);
+                    await navigator.serviceWorker.register('/sw.js', { scope: '/' });
                 } catch (e) { console.error('[dill-sw] register failed:', e); return false; }
                 if (navigator.serviceWorker.controller) {
-                    console.log('[dill-sw] already controlled');
                     return true;
                 }
                 // Wait for the SW to claim this page. Three signals, whichever
@@ -1906,18 +1904,16 @@
                     const check = () => {
                         if (settled) return;
                         if (navigator.serviceWorker.controller) {
-                            console.log('[dill-sw] controller appeared via', check._src || 'poll');
                             settled = true;
                             cleanup();
                             resolve(true);
                         }
                     };
-                    const onControllerChange = () => { check._src = 'controllerchange'; check(); };
-                    const onSwReadyEvent = () => { check._src = 'DILL_SW_ACTIVE'; check(); };
+                    const onControllerChange = check;
+                    const onSwReadyEvent = check;
                     navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
                     window.addEventListener('dill-sw-controller-ready', onSwReadyEvent);
                     navigator.serviceWorker.ready.then((reg) => {
-                        console.log('[dill-sw] ready resolved. controller =', !!navigator.serviceWorker.controller);
                         for (let i = 0; i < 10; i++) setTimeout(check, 200 * (i + 1));
                     });
                     const cleanup = () => {
@@ -1926,7 +1922,6 @@
                         clearTimeout(timer);
                     };
                     const timer = setTimeout(() => {
-                        console.log('[dill-sw] timed out waiting for controller. controller =', !!navigator.serviceWorker.controller);
                         cleanup();
                         resolve(false);
                     }, 20000);
@@ -1938,9 +1933,8 @@
         // Send decryption metadata for a given stream path to the SW and
         // resolve once the SW acknowledges it is ready to serve that path.
         // Times out after 5s so preview falls back instead of hanging.
-        async function initPreviewStream(streamPath, key, fileMeta, contentType) {
+        async function initPreviewStream(streamPath, fileMeta, contentType) {
             const ok = await ensureStreamingSW();
-            console.log('[dill-sw] initPreviewStream: ensureStreamingSW =', ok, 'controller =', !!navigator.serviceWorker.controller);
             if (!ok || !navigator.serviceWorker.controller) {
                 throw new Error('Service worker unavailable');
             }
@@ -1962,10 +1956,9 @@
                     }
                 }, 5000);
                 pendingStreamInits.set(streamPath, {
-                    resolve: () => { clearTimeout(timer); console.log('[dill-sw] initPreviewStream: got READY'); resolve(); },
-                    reject: (e) => { clearTimeout(timer); console.error('[dill-sw] initPreviewStream: got error', e); reject(e); }
+                    resolve: () => { clearTimeout(timer); resolve(); },
+                    reject: (e) => { clearTimeout(timer); reject(e); }
                 });
-                console.log('[dill-sw] initPreviewStream: posting INIT for', streamPath);
                 navigator.serviceWorker.controller.postMessage({
                     type: 'DILL_PREVIEW_INIT',
                     streamPath,
@@ -2512,7 +2505,6 @@
                                 throw new Error('S3 returned an invalid Content-Range header. Check bucket CORS ExposeHeaders.');
                             }
                             const arrayBuf = await res.arrayBuffer();
-                            if (checkAbort()) break;
                             const block = new Uint8Array(arrayBuf);
                             if (block.length !== expectedLength) {
                                 throw new Error(`Invalid range length for chunk ${chunkIdx}`);
@@ -2520,9 +2512,7 @@
                             const iv = block.subarray(0, 12);
                             const ct = block.subarray(12);
                             pool.decrypt(iv, ct, rawKeyBytes, arrayBuf)
-                                .then(pt => {
-                                    if (!checkAbort()) resolvers[chunkIdx](pt);
-                                })
+                                .then(pt => resolvers[chunkIdx](pt))
                                 .catch(err => rejecters[chunkIdx](err));
                         } catch (err) {
                             rejecters[chunkIdx](err);
@@ -2653,9 +2643,17 @@
                 const channel = new MessageChannel();
 
                 return await new Promise((resolve) => {
-                    const timer = setTimeout(() => resolve(null), 3000);
+                    let settled = false;
+                    const timer = setTimeout(() => {
+                        if (settled) return;
+                        settled = true;
+                        navigator.serviceWorker.removeEventListener('message', onMsg);
+                        try { channel.port1.postMessage('abort'); } catch (_) {}
+                        resolve(null);
+                    }, 3000);
                     const onMsg = (evt) => {
-                        if (evt.data && evt.data.type === 'DILL_DOWNLOAD_READY' && evt.data.streamPath === streamPath) {
+                        if (!settled && evt.data && evt.data.type === 'DILL_DOWNLOAD_READY' && evt.data.streamPath === streamPath) {
+                            settled = true;
                             clearTimeout(timer);
                             navigator.serviceWorker.removeEventListener('message', onMsg);
 
@@ -2673,7 +2671,10 @@
                                 async write(chunk) {
                                     if (isCancelled) throw new Error('Download stream cancelled by user');
                                     if (isClosed) throw new Error('Download stream closed');
-                                    const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+                                    const source = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+                                    // Transfer a copy so callers (notably fflate) never
+                                    // have their reusable backing buffer detached.
+                                    const u8 = new Uint8Array(source);
                                     channel.port1.postMessage(u8, [u8.buffer]);
                                 },
                                 async close() {
@@ -2851,7 +2852,7 @@
         // App Routing Handler
         function handleRouting() {
             const path = window.location.pathname;
-            const shareMatch = path.match(/^\/share\/([a-zA-Z0-9-]+)/);
+            const shareMatch = path.match(/^\/share\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/);
             
             if (shareMatch) {
                 const uuid = shareMatch[1];
@@ -3069,11 +3070,13 @@
 
         // File size formatter
         function formatBytes(bytes, decimals = 2) {
+            bytes = Number(bytes);
+            if (!Number.isFinite(bytes) || bytes < 0) return 'Unknown';
             if (bytes === 0) return '0 B';
             const k = 1024;
             const dm = decimals < 0 ? 0 : decimals;
-            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+            const i = Math.min(sizes.length - 1, Math.floor(Math.log(bytes) / Math.log(k)));
             return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
         }
 
@@ -3083,7 +3086,18 @@
             return String(str).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
         }
 
-        // Vendored Marked.js Markdown renderer
+        function safeMarkdownHref(value) {
+            try {
+                const parsed = new URL(String(value), window.location.origin);
+                if (!['http:', 'https:', 'mailto:'].includes(parsed.protocol)) return null;
+                return parsed.href;
+            } catch (_) {
+                return null;
+            }
+        }
+
+        // Vendored Marked.js Markdown renderer. Raw HTML and remote images are
+        // deliberately disabled because share notes are untrusted content.
         let markedConfigured = false;
         function configureMarked() {
             if (markedConfigured || typeof marked === 'undefined') return;
@@ -3112,14 +3126,19 @@
                         return `<hr class="md-hr">\n`;
                     },
                     link(token) {
-                        const href = token.href;
-                        const title = token.title;
+                        const href = safeMarkdownHref(token.href);
                         const text = this.parser.parseInline(token.tokens);
-                        if (href === null) return text;
-                        let out = `<a href="${href}" class="md-link" target="_blank" rel="noopener noreferrer"`;
-                        if (title) out += ` title="${title}"`;
+                        if (!href) return text;
+                        let out = `<a href="${escapeHtml(href)}" class="md-link" target="_blank" rel="noopener noreferrer"`;
+                        if (token.title) out += ` title="${escapeHtml(token.title)}"`;
                         out += `>${text}</a>`;
                         return out;
+                    },
+                    image(token) {
+                        return escapeHtml(token.text || token.href || 'image');
+                    },
+                    html(token) {
+                        return escapeHtml(token.text || token.raw || '');
                     },
                     codespan(token) {
                         return `<code class="md-inline-code">${escapeHtml(token.text)}</code>`;
@@ -3143,10 +3162,10 @@
                     return marked.parse(String(text));
                 } catch (e) {
                     console.error('Markdown rendering error:', e);
-                    return String(text);
+                    return escapeHtml(String(text));
                 }
             }
-            return String(text);
+            return escapeHtml(String(text));
         }
 
         // --- UPLOAD PANEL ---
@@ -3243,27 +3262,41 @@
             }
 
             if (scannedFiles.length > 0) {
-                selectedFiles = selectedFiles.concat(scannedFiles);
-                updateSelectedFilesUI();
+                addSelectedFiles(scannedFiles);
             }
         });
 
+        function addSelectedFiles(items) {
+            const existingPaths = new Set(selectedFiles.map(item => item.relativePath));
+            let skipped = 0;
+            for (const item of items) {
+                const path = String(item.relativePath || '');
+                const parts = path.split('/');
+                if (!path || path.length > 1024 || path.includes('\\') || path.includes('\0') ||
+                    parts.some(part => !part || part === '.' || part === '..') || existingPaths.has(path) ||
+                    selectedFiles.length >= 1000) {
+                    skipped++;
+                    continue;
+                }
+                existingPaths.add(path);
+                selectedFiles.push({ file: item.file, relativePath: path });
+            }
+            if (skipped) showToast(`${skipped} duplicate, invalid, or excess file(s) were skipped.`, 'info');
+            updateSelectedFilesUI();
+        }
+
         function handleFileSelection(e) {
             const files = Array.from(e.target.files);
-            const formatted = files.map(file => ({ file, relativePath: file.name }));
-            selectedFiles = selectedFiles.concat(formatted);
-            updateSelectedFilesUI();
+            addSelectedFiles(files.map(file => ({ file, relativePath: file.name })));
             fileSelect.value = ''; // Reset
         }
 
         function handleFolderSelection(e) {
             const files = Array.from(e.target.files);
-            const formatted = files.map(file => ({ 
-                file, 
-                relativePath: file.webkitRelativePath || file.name 
-            }));
-            selectedFiles = selectedFiles.concat(formatted);
-            updateSelectedFilesUI();
+            addSelectedFiles(files.map(file => ({
+                file,
+                relativePath: file.webkitRelativePath || file.name
+            })));
             folderSelect.value = ''; // Reset
         }
 
@@ -3297,7 +3330,7 @@
                     <div class="file-info">
                         ${getFileIcon(item.relativePath)}
                         <div style="min-width: 0;">
-                            <div class="file-name" title="${item.relativePath}">${item.relativePath}</div>
+                            <div class="file-name" title="${escapeHtml(item.relativePath)}">${escapeHtml(item.relativePath)}</div>
                             <div class="file-meta">${formatBytes(item.file.size)}</div>
                         </div>
                     </div>
@@ -3849,18 +3882,21 @@
                         // Mark production complete once all encryption is done, and
                         // wake any upload worker blocked on the part signal so it can
                         // observe producersDone and exit cleanly.
-                        (async () => {
-                            await Promise.all(encryptWorkers);
-                            producersDone = true;
-                            notifyPartAvailable();
-                        })();
+                        const producerCompletion = Promise.all(encryptWorkers)
+                            .catch((error) => {
+                                uploadError = error;
+                            })
+                            .finally(() => {
+                                producersDone = true;
+                                notifyPartAvailable();
+                            });
 
                         // Start a small, fixed upload consumer pool.
                         const uploadWorkers = [];
                         for (let w = 0; w < numUploadWorkers; w++) {
                             uploadWorkers.push(uploadWorker());
                         }
-                        await Promise.all(uploadWorkers);
+                        await Promise.all([producerCompletion, ...uploadWorkers]);
 
                         if (uploadError) throw uploadError;
 
@@ -3906,7 +3942,8 @@
                     }
 
                     const activeFileWorkers = [];
-                    const numFileWorkers = Math.min(4, selectedFiles.length);
+                    const hasMultipartFiles = selectedFiles.some(item => item.file.size > 8 * 1024 * 1024);
+                    const numFileWorkers = Math.min(hasMultipartFiles ? 2 : 4, selectedFiles.length);
                     for (let w = 0; w < numFileWorkers; w++) {
                         activeFileWorkers.push(fileWorker());
                     }
@@ -4062,7 +4099,7 @@
                         return;
                     }
                 } else {
-                    shares = JSON.parse(localStorage.getItem('my_shares') || '[]');
+                    shares = normalizeAccountShares(JSON.parse(localStorage.getItem('my_shares') || '[]'));
                 }
                 
                 if (shares.length === 0) {
@@ -4205,24 +4242,23 @@
                                     headers: headers
                                 });
                                 
-                                if (isLoggedIn) {
-                                    const accountShares = await fetchAccountShares();
-                                    const updated = accountShares.filter(s => s.uuid !== uuid);
-                                    await saveAccountShares(updated);
-                                } else {
-                                    const myShares = JSON.parse(localStorage.getItem('my_shares') || '[]');
-                                    const updated = myShares.filter(s => s.uuid !== uuid);
-                                    localStorage.setItem('my_shares', JSON.stringify(updated));
-                                }
-
                                 if (delRes.ok || delRes.status === 404) {
+                                    if (isLoggedIn) {
+                                        const accountShares = await fetchAccountShares();
+                                        const updated = accountShares.filter(s => s.uuid !== uuid);
+                                        await saveAccountShares(updated);
+                                    } else {
+                                        const myShares = normalizeAccountShares(JSON.parse(localStorage.getItem('my_shares') || '[]'));
+                                        const updated = myShares.filter(s => s.uuid !== uuid);
+                                        localStorage.setItem('my_shares', JSON.stringify(updated));
+                                    }
                                     showToast('Share deleted successfully', 'success');
+                                    loadSharesList();
                                 } else {
                                     showToast('Delete failed: ' + await delRes.text(), 'error');
                                     targetBtn.disabled = false;
                                     targetBtn.innerHTML = origHTML;
                                 }
-                                loadSharesList();
                             } catch (err) {
                                 showToast('Network error during delete', 'error');
                                 targetBtn.disabled = false;
@@ -4242,6 +4278,57 @@
 
         // --- SHARE VIEWER (PREVIEW & DECRYPTION MODE) ---
         let countdownInterval = null;
+
+        function validateShareMetadata(metadata, rawDetails) {
+            if (!metadata || !Array.isArray(metadata.files) || metadata.files.length < 1 || metadata.files.length > 1000) {
+                throw new Error('The encrypted share metadata is invalid.');
+            }
+            const serverFiles = new Map();
+            for (const file of (rawDetails && Array.isArray(rawDetails.files) ? rawDetails.files : [])) {
+                if (file && typeof file.name === 'string' && Number.isSafeInteger(file.size) && file.size > 0) {
+                    serverFiles.set(file.name, file.size);
+                }
+            }
+            if (serverFiles.size !== metadata.files.length) {
+                throw new Error('The encrypted metadata does not match the stored file set.');
+            }
+
+            const ids = new Set();
+            const files = metadata.files.map((file) => {
+                if (!file || typeof file !== 'object') throw new Error('Invalid file metadata.');
+                const id = String(file.id);
+                if (!/^(0|[1-9]\d*)$/.test(id) || Number(id) >= metadata.files.length || ids.has(id)) {
+                    throw new Error('Invalid or duplicate file identifier.');
+                }
+                ids.add(id);
+                const name = typeof file.name === 'string' ? file.name : '';
+                const pathParts = name.split('/');
+                if (!name || name.length > 1024 || name.includes('\\') || name.includes('\0') ||
+                    pathParts.some(part => !part || part === '.' || part === '..')) {
+                    throw new Error('Invalid shared file path.');
+                }
+                const size = Number(file.size);
+                if (!Number.isSafeInteger(size) || size < 0) throw new Error('Invalid shared file size.');
+                const chunks = file.chunked === true ? Math.max(1, Math.ceil(size / ENCRYPT_CHUNK_SIZE)) : 1;
+                const expectedEncryptedSize = size + chunks * 28;
+                if (serverFiles.get(`file_${id}.enc`) !== expectedEncryptedSize) {
+                    throw new Error('Shared file metadata does not match its encrypted payload.');
+                }
+                const type = typeof file.type === 'string' && file.type.length <= 255 && !/[\r\n\0]/.test(file.type)
+                    ? file.type
+                    : 'application/octet-stream';
+                return { id, name, size, type, chunked: file.chunked === true, thumb: file.thumb === true };
+            });
+            if (ids.size !== files.length) throw new Error('Incomplete file metadata.');
+
+            const message = metadata.message == null ? null : String(metadata.message);
+            if (message && message.length > 4000) throw new Error('The encrypted share note is too long.');
+            const ownerPfp = typeof metadata.owner_pfp === 'string' &&
+                /^data:image\/(?:png|jpeg|webp);base64,/i.test(metadata.owner_pfp) && metadata.owner_pfp.length <= 8_000_000
+                ? metadata.owner_pfp
+                : null;
+            return { files, message, owner_pfp: ownerPfp };
+        }
 
         async function loadShareDetails(uuid) {
             try {
@@ -4320,19 +4407,21 @@
                     return;
                 }
 
-                // 3. Assemble decrypted share data
+                // 3. Validate the untrusted encrypted manifest against the
+                // server's finalized object list before placing values in the DOM.
+                const validatedMeta = validateShareMetadata(decMeta, rawDetails);
                 currentShareData = {
                     uuid: uuid,
                     upload_time: rawDetails.upload_time,
                     expires_at: rawDetails.expires_at,
-                    files: decMeta.files, // contains [{ id, name, size, type }]
-                    message: decMeta.message || null,
-                    owner_pfp: decMeta.owner_pfp || null
+                    files: validatedMeta.files,
+                    message: validatedMeta.message,
+                    owner_pfp: validatedMeta.owner_pfp
                 };
 
                 // Setup countdown clock
                 const totalShareSize = (currentShareData.files || []).reduce((sum, f) => sum + (f.size || 0), 0);
-                shareCreatedDate.textContent = `Uploaded on: ${new Date(currentShareData.upload_time).toLocaleString()} â€¢ Total Size: ${formatBytes(totalShareSize)}`;
+                shareCreatedDate.textContent = `Uploaded on: ${new Date(currentShareData.upload_time).toLocaleString()} • Total Size: ${formatBytes(totalShareSize)}`;
                 shareCountdown.style.display = 'inline-flex';
 
                 // Render decrypted share message if present
@@ -4411,7 +4500,7 @@
         }
 
         // Load and decrypt a pre-generated encrypted thumbnail (file_<id>.thumb.enc)
-        // â€” a tiny standalone object, so RAM/bandwidth stay flat regardless of the
+        // — a tiny standalone object, so RAM/bandwidth stay flat regardless of the
         // original file size. `file.thumb` (set in metadata at upload time) gates
         // the fetch; older shares without that field fall back to the SVG icon.
         // `isVideo` only controls the badge overlay; the thumbnail itself is
@@ -4486,7 +4575,7 @@
                 card.className = 'explorer-item';
                 card.innerHTML = `
                     <div class="explorer-item-icon">${ICONS.folder}</div>
-                    <div class="explorer-item-name" title="${dirName}">${dirName}</div>
+                    <div class="explorer-item-name" title="${escapeHtml(dirName)}">${escapeHtml(dirName)}</div>
                     <div class="explorer-item-size">Folder</div>
                 `;
                 card.addEventListener('click', () => {
@@ -4507,7 +4596,7 @@
                 
                 card.innerHTML = `
                     <div class="explorer-item-icon" id="icon-${file.id}">${getFileIcon(filename)}</div>
-                    <div class="explorer-item-name" title="${filename}">${filename}</div>
+                    <div class="explorer-item-name" title="${escapeHtml(filename)}">${escapeHtml(filename)}</div>
                     <div class="explorer-item-size">${formatBytes(file.size)}</div>
                 `;
                 
@@ -4668,13 +4757,11 @@
             // Fast streaming path for media via the preview service worker.
             if (isStreamingMedia) {
                 let streamUrl = null;
-                console.log('[dill-sw] opening streaming preview for', ext, 'isVideo=', isVideo, 'isAudio=', isAudio, 'file=', file);
                 try {
                     const streamPath = `/preview-stream/${currentShareUUID}/${file.id}`;
                     const contentType = file.type || mimeForExt(ext);
-                    await initPreviewStream(streamPath, key, file, contentType);
+                    await initPreviewStream(streamPath, file, contentType);
                     streamUrl = streamPath;
-                    console.log('[dill-sw] stream initialized, setting media src to', streamUrl);
 
                     previewContentBox.innerHTML = '';
                     btnPreviewDownload.style.opacity = '1';
@@ -4813,7 +4900,7 @@
                     <div style="color:var(--danger); text-align:center;">
                         <svg viewBox="0 0 24 24" style="width:3rem;height:3rem;fill:currentColor;margin-bottom:1rem;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v5z"/></svg>
                         <h4>Decryption Error</h4>
-                        <p>${err.message}</p>
+                        <p>${escapeHtml(err.message)}</p>
                     </div>
                 `;
             }
@@ -4844,7 +4931,7 @@
 
         // Download all files in share decrypted inside a streaming ZIP.
         // Uses fflate's streaming Zip API so that decrypted chunks flow directly
-        // into the ZIP output â†’ disk sink, keeping memory usage flat regardless
+        // into the ZIP output → disk sink, keeping memory usage flat regardless
         // of total share size. Falls back to in-memory blob only as last resort.
         btnDownloadAll.addEventListener('click', async () => {
             if (btnDownloadAll.disabled) return;
@@ -5110,11 +5197,30 @@
             };
         }
 
+        function normalizeAccountShares(value) {
+            if (!Array.isArray(value)) throw new Error('Invalid synced share list');
+            const seen = new Set();
+            return value.filter(share => {
+                if (!share || typeof share !== 'object') return false;
+                const valid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(share.uuid) &&
+                    /^[0-9a-f]{64}$/.test(share.key) &&
+                    Number.isInteger(share.files_count) && share.files_count >= 1 && share.files_count <= 1000 &&
+                    Number.isSafeInteger(share.total_size) && share.total_size >= 0 && !seen.has(share.uuid);
+                if (valid) seen.add(share.uuid);
+                return valid;
+            }).map(share => ({
+                uuid: share.uuid,
+                key: share.key,
+                files_count: share.files_count,
+                total_size: share.total_size
+            }));
+        }
+
         async function fetchAccountShares(overrideKeyBuf = null, silent = false) {
             const token = localStorage.getItem('dill_session_token');
             const encKeyHex = localStorage.getItem('dill_enc_key');
-            if (!token) return [];
-            if (!overrideKeyBuf && !encKeyHex) return [];
+            if (!token) throw new Error('You are not signed in');
+            if (!overrideKeyBuf && !encKeyHex) throw new Error('This device has no account encryption key');
 
             try {
                 const res = await fetch('/api/user/shares', {
@@ -5138,8 +5244,10 @@
                     false,
                     ["decrypt"]
                 );
-                const decBuf = await decryptData(hexToBuf(data.shares_enc), key);
-                return JSON.parse(new TextDecoder().decode(decBuf));
+                const encryptedShares = hexToBuf(data.shares_enc);
+                if (!encryptedShares) throw new Error('Invalid encrypted share list');
+                const decBuf = await decryptData(encryptedShares, key);
+                return normalizeAccountShares(JSON.parse(new TextDecoder().decode(decBuf)));
             } catch (e) {
                 if (!silent) {
                     showToast('Failed to decrypt account shares: ' + e.message, 'error');
@@ -5149,9 +5257,10 @@
         }
 
         async function saveAccountShares(shares) {
+            shares = normalizeAccountShares(shares);
             const token = localStorage.getItem('dill_session_token');
             const encKeyHex = localStorage.getItem('dill_enc_key');
-            if (!token || !encKeyHex) return;
+            if (!token || !encKeyHex) throw new Error('Account encryption is locked on this device');
 
             try {
                 const key = await window.crypto.subtle.importKey(
@@ -5177,7 +5286,7 @@
                     throw new Error(await res.text());
                 }
             } catch (e) {
-                showToast('Failed to sync shares: ' + e.message, 'error');
+                throw new Error('Failed to sync shares: ' + e.message);
             }
         }
 
@@ -5406,19 +5515,34 @@
                     const finalData = await finishRes.json();
                     
                     const loggedInUsername = finalData.username;
-                    localStorage.setItem('dill_session_token', finalData.token);
-                    localStorage.setItem('dill_username', loggedInUsername);
-                    
                     let encKeyHex = localStorage.getItem('dill_enc_key_' + loggedInUsername) || localStorage.getItem('dill_enc_key');
                     if (!encKeyHex) {
                         const pwd = await customPrompt('Please enter your password once to unlock zero-knowledge encryption on this device:', 'Unlock Device Encryption', '', true);
-                        if (pwd) {
-                            const keys = await deriveUserKeys(loggedInUsername, pwd);
-                            encKeyHex = bufToHex(keys.encKeyBuf);
-                            localStorage.setItem('dill_enc_key_' + loggedInUsername, encKeyHex);
+                        if (!pwd) {
+                            try {
+                                const sessionsRes = await fetch('/api/user/sessions', {
+                                    headers: { 'Authorization': `Bearer ${finalData.token}` }
+                                });
+                                if (sessionsRes.ok) {
+                                    const sessions = await sessionsRes.json();
+                                    const current = sessions.find(session => session.is_current);
+                                    if (current) {
+                                        await fetch(`/api/user/sessions/${current.id}`, {
+                                            method: 'DELETE',
+                                            headers: { 'Authorization': `Bearer ${finalData.token}` }
+                                        });
+                                    }
+                                }
+                            } catch (_) {}
+                            throw new Error('Your password is required once to unlock encryption on this device.');
                         }
+                        const keys = await deriveUserKeys(loggedInUsername, pwd);
+                        encKeyHex = bufToHex(keys.encKeyBuf);
+                        localStorage.setItem('dill_enc_key_' + loggedInUsername, encKeyHex);
                     }
                     if (encKeyHex) {
+                        localStorage.setItem('dill_session_token', finalData.token);
+                        localStorage.setItem('dill_username', loggedInUsername);
                         localStorage.setItem('dill_enc_key', encKeyHex);
                         const pfpEncHex = finalData.pfp_enc || finalData.pfp;
                         if (pfpEncHex) {
@@ -5447,6 +5571,10 @@
 
             if (!username || !password) return;
 
+            if (isRegisterMode && password.length < 8) {
+                showToast('Password must be at least 8 characters', 'error');
+                return;
+            }
             if (isRegisterMode && password !== authConfirmPasswordInput.value) {
                 showToast('Passwords do not match', 'error');
                 return;
@@ -5674,6 +5802,10 @@
 
             if (!currentPassword || !newPassword || !newPasswordConfirm || !username || !token) return;
 
+            if (newPassword.length < 8) {
+                showToast('New password must be at least 8 characters', 'error');
+                return;
+            }
             if (newPassword !== newPasswordConfirm) {
                 showToast('New passwords do not match', 'error');
                 return;
@@ -5709,7 +5841,7 @@
                 }
 
                 // 4. Send to backend
-                const res = await fetch('/api/user/change_password', {
+                const res = await fetch('/api/user/password', {
                     method: 'POST',
                     headers: {
                         'Authorization': `Bearer ${token}`,
@@ -5724,7 +5856,9 @@
                 });
 
                 if (res.ok) {
-                    localStorage.setItem('dill_enc_key', bufToHex(newKeys.encKeyBuf));
+                    const newEncryptionKeyHex = bufToHex(newKeys.encKeyBuf);
+                    localStorage.setItem('dill_enc_key', newEncryptionKeyHex);
+                    localStorage.setItem('dill_enc_key_' + username, newEncryptionKeyHex);
                     showToast('Password changed successfully!', 'success');
                     settingsPasswordForm.reset();
                 } else {
@@ -5752,7 +5886,7 @@
                 btnDeleteAccount.textContent = 'Deleting Account...';
 
                 try {
-                    const res = await fetch('/api/user/account', {
+                    const res = await fetch('/api/user', {
                         method: 'DELETE',
                         headers: { 'Authorization': `Bearer ${token}` }
                     });
@@ -6095,18 +6229,15 @@
                             method: 'POST',
                             headers: { 'Authorization': `Bearer ${tokenInput}` }
                         });
-                        if (res.ok) {
-                            const data = await res.json();
-                            localStorage.setItem('dill_admin_token', data.token);
-                            showToast('Admin logged in successfully', 'success');
-                            loadAdminStats();
-                        } else {
-                            localStorage.setItem('dill_admin_token', tokenInput);
-                            loadAdminStats();
-                        }
-                    } catch (err) {
-                        localStorage.setItem('dill_admin_token', tokenInput);
+                        if (!res.ok) throw new Error(await res.text() || 'Invalid admin token');
+                        const data = await res.json();
+                        localStorage.setItem('dill_admin_token', data.token);
+                        document.getElementById('admin-token-input').value = '';
+                        showToast('Admin logged in successfully', 'success');
                         loadAdminStats();
+                    } catch (err) {
+                        localStorage.removeItem('dill_admin_token');
+                        showToast(err.message || 'Admin login failed', 'error');
                     }
                 }
             });
@@ -6114,9 +6245,25 @@
 
         async function loadAdminStats() {
             const params = new URLSearchParams(window.location.search);
-            let token = params.get('token');
-            if (!token) {
-                token = localStorage.getItem('dill_admin_token');
+            const bootstrapToken = params.get('token');
+            let token = localStorage.getItem('dill_admin_token');
+            if (bootstrapToken) {
+                // Exchange legacy query-string bootstrap tokens immediately so
+                // the administrator secret does not remain in browser history.
+                window.history.replaceState({}, '', '/admin');
+                try {
+                    const login = await fetch('/api/admin/login', {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bearer ${bootstrapToken}` }
+                    });
+                    if (!login.ok) throw new Error(await login.text());
+                    token = (await login.json()).token;
+                    localStorage.setItem('dill_admin_token', token);
+                } catch (error) {
+                    token = null;
+                    localStorage.removeItem('dill_admin_token');
+                    showToast(error.message || 'Invalid admin token', 'error');
+                }
             }
             const dashboard = document.getElementById('admin-dashboard');
             const tokenReq = document.getElementById('admin-token-required');
@@ -6185,7 +6332,7 @@
                     const row = document.createElement('tr');
                     row.innerHTML = `
                         <td>
-                            <span style="font-family:monospace; font-weight:600; color:var(--primary);">${u.username}</span>
+                            <span style="font-family:monospace; font-weight:600; color:var(--primary);">${escapeHtml(u.username)}</span>
                         </td>
                         <td>${u.shares.length} shares</td>
                         <td>${formatBytes(u.total_size)}</td>
@@ -6229,12 +6376,12 @@
                                 <tbody>
                                     ${u.shares.map(s => `
                                         <tr>
-                                            <td style="padding:0.5rem; font-size:0.75rem; font-family:monospace; color:var(--text-muted);">${s.uuid}</td>
-                                            <td style="padding:0.5rem; font-size:0.75rem;">${s.files_count}</td>
+                                            <td style="padding:0.5rem; font-size:0.75rem; font-family:monospace; color:var(--text-muted);">${escapeHtml(s.uuid)}</td>
+                                            <td style="padding:0.5rem; font-size:0.75rem;">${escapeHtml(s.files_count)}</td>
                                             <td style="padding:0.5rem; font-size:0.75rem;">${formatBytes(s.total_size)}</td>
                                             <td style="padding:0.5rem; font-size:0.75rem;">${new Date(s.created_at).toLocaleDateString()}</td>
                                             <td style="padding:0.5rem; font-size:0.75rem; text-align:right;">
-                                                <button class="action-btn delete delete-share-btn" data-uuid="${s.uuid}" style="padding: 0.2rem 0.4rem; font-size:0.7rem; font-weight:600; display:inline-flex;">
+                                                <button class="action-btn delete delete-share-btn" data-uuid="${escapeHtml(s.uuid)}" style="padding: 0.2rem 0.4rem; font-size:0.7rem; font-weight:600; display:inline-flex;">
                                                     Delete
                                                 </button>
                                             </td>
@@ -6248,7 +6395,7 @@
                     subRow.innerHTML = `
                         <td colspan="5" style="background: rgba(255, 255, 255, 0.005); padding: 0.5rem 1rem 1rem 1rem;">
                             <div style="border-left: 2px solid var(--primary); padding-left: 1rem;">
-                                <h4 style="font-size:0.8rem; margin-bottom:0.25rem;">Active Shares for ${u.username}</h4>
+                                <h4 style="font-size:0.8rem; margin-bottom:0.25rem;">Active Shares for ${escapeHtml(u.username)}</h4>
                                 ${sharesListHTML}
                             </div>
                         </td>
@@ -6262,7 +6409,7 @@
                     sessionsSubRow.innerHTML = `
                         <td colspan="5" style="background: rgba(255, 255, 255, 0.005); padding: 0.5rem 1rem 1rem 1rem;">
                             <div style="border-left: 2px solid var(--primary); padding-left: 1rem;">
-                                <h4 style="font-size:0.8rem; margin-bottom:0.25rem;">Active Sessions for ${u.username}</h4>
+                                <h4 style="font-size:0.8rem; margin-bottom:0.25rem;">Active Sessions for ${escapeHtml(u.username)}</h4>
                                 <div id="admin-sessions-container-${u.username}">
                                     <div class="loader" style="margin:1rem auto; display:block;"></div>
                                 </div>
@@ -6346,13 +6493,13 @@
                                                     <td style="padding:0.5rem; font-size:0.75rem;">
                                                         <div style="display:flex; flex-direction:column;">
                                                             ${s.name ? `<span style="font-weight:600; color:var(--primary);">${escapeHtml(s.name)}</span><span style="font-size:0.7rem; font-weight:500;">${parseUserAgent(s.user_agent)}</span>` : `<span style="font-weight:600;">${parseUserAgent(s.user_agent)}</span>`}
-                                                            <span style="font-size:0.65rem; color:var(--text-muted); font-family:monospace; margin-top:0.1rem; word-break:break-all;">${s.user_agent}</span>
+                                                            <span style="font-size:0.65rem; color:var(--text-muted); font-family:monospace; margin-top:0.1rem; word-break:break-all;">${escapeHtml(s.user_agent)}</span>
                                                         </div>
                                                     </td>
-                                                    <td style="padding:0.5rem; font-size:0.75rem; font-family:monospace;">${s.ip}</td>
+                                                    <td style="padding:0.5rem; font-size:0.75rem; font-family:monospace;">${escapeHtml(s.ip)}</td>
                                                     <td style="padding:0.5rem; font-size:0.75rem;">${new Date(s.created_at * 1000).toLocaleString()}</td>
                                                     <td style="padding:0.5rem; font-size:0.75rem; text-align:right;">
-                                                        <button class="action-btn delete admin-revoke-user-session-btn" data-username="${username}" data-session-id="${s.id}" style="padding: 0.2rem 0.4rem; font-size:0.7rem; font-weight:600; display:inline-flex;">
+                                                        <button class="action-btn delete admin-revoke-user-session-btn" data-username="${username}" data-session-id="${escapeHtml(s.id)}" style="padding: 0.2rem 0.4rem; font-size:0.7rem; font-weight:600; display:inline-flex;">
                                                             Revoke
                                                         </button>
                                                     </td>
@@ -6398,7 +6545,7 @@
                                 });
 
                             } catch (err) {
-                                container.innerHTML = `<div style="color:var(--danger); padding:0.5rem 1rem; font-size:0.8rem;">Failed to load sessions: ${err.message}</div>`;
+                                container.innerHTML = `<div style="color:var(--danger); padding:0.5rem 1rem; font-size:0.8rem;">Failed to load sessions: ${escapeHtml(err.message)}</div>`;
                             }
                         } else {
                             subRow.style.display = 'none';
@@ -6480,7 +6627,7 @@
                 if (adminLoading) adminLoading.style.display = 'none';
                 dashboard.style.display = 'block';
                 showToast(err.message, 'error');
-                usersBody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--danger); padding:2rem;">Error: ${err.message}</td></tr>`;
+                usersBody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--danger); padding:2rem;">Error: ${escapeHtml(err.message)}</td></tr>`;
             }
         }
 
@@ -6552,18 +6699,18 @@
                             <div style="display:flex; flex-direction:column;">
                                 ${titleHtml}
                                 <span style="font-size:0.75rem; color:var(--text-muted); font-family:monospace; margin-top:0.2rem; word-break:break-all;">
-                                    ${session.user_agent}
+                                    ${escapeHtml(session.user_agent)}
                                 </span>
                             </div>
                         </td>
-                        <td style="padding: 1rem 0.85rem; font-family:monospace; border-bottom: 1px solid var(--surface-border);">${ipStr}</td>
+                        <td style="padding: 1rem 0.85rem; font-family:monospace; border-bottom: 1px solid var(--surface-border);">${escapeHtml(ipStr)}</td>
                         <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border); font-size:0.8rem;">${createdDate}</td>
                         <td style="padding: 1rem 0.85rem; text-align:right; border-bottom: 1px solid var(--surface-border);">
                             <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
-                                <button class="btn btn-secondary btn-rename-admin-session" data-id="${session.id}" data-name="${escapeHtml(session.name || '')}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
+                                <button class="btn btn-secondary btn-rename-admin-session" data-id="${escapeHtml(session.id)}" data-name="${escapeHtml(session.name || '')}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
                                     Rename
                                 </button>
-                                <button class="${buttonClass} btn-revoke-admin-session" data-id="${session.id}" data-current="${session.is_current}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
+                                <button class="${buttonClass} btn-revoke-admin-session" data-id="${escapeHtml(session.id)}" data-current="${session.is_current}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
                                     Revoke
                                 </button>
                             </div>
@@ -6644,7 +6791,7 @@
                 adminSessionsBody.innerHTML = `
                     <tr>
                         <td colspan="5" style="text-align:center; color:var(--danger); padding:2rem 0;">
-                            Failed to load admin sessions: ${err.message}
+                            Failed to load admin sessions: ${escapeHtml(err.message)}
                         </td>
                     </tr>
                 `;
@@ -6727,11 +6874,11 @@
                     row.innerHTML = `
                         <div style="display:flex; flex-direction:column; gap:0.2rem;">
                             <span style="font-weight:600; font-size: 0.9rem; color:var(--text-main);">${escapeHtml(name)}</span>
-                            <span style="font-size:0.75rem; color:var(--text-muted); font-family: monospace;">ID: ${pk.id.substring(0, 16)}...</span>
+                            <span style="font-size:0.75rem; color:var(--text-muted); font-family: monospace;">ID: ${escapeHtml(pk.id.substring(0, 16))}...</span>
                         </div>
                         <div style="display:flex; gap:0.5rem;">
-                            <button class="btn btn-secondary btn-rename" style="padding: 0.3rem 0.6rem; font-size: 0.75rem;" data-id="${pk.id}">Rename</button>
-                            <button class="btn btn-danger btn-delete" style="padding: 0.3rem 0.6rem; font-size: 0.75rem;" data-id="${pk.id}">Delete</button>
+                            <button class="btn btn-secondary btn-rename" style="padding: 0.3rem 0.6rem; font-size: 0.75rem;" data-id="${escapeHtml(pk.id)}">Rename</button>
+                            <button class="btn btn-danger btn-delete" style="padding: 0.3rem 0.6rem; font-size: 0.75rem;" data-id="${escapeHtml(pk.id)}">Delete</button>
                         </div>
                     `;
                     
@@ -6778,7 +6925,7 @@
             } catch (err) {
                 passkeysListContainer.innerHTML = `
                     <div style="text-align:center; color:var(--error); padding:1rem 0; font-size: 0.85rem;">
-                        Failed to load passkeys: ${err.message}
+                        Failed to load passkeys: ${escapeHtml(err.message)}
                     </div>
                 `;
             }
@@ -6857,18 +7004,18 @@
                             <div style="display:flex; flex-direction:column;">
                                 ${titleHtml}
                                 <span style="font-size:0.75rem; color:var(--text-muted); font-family:monospace; margin-top:0.2rem; word-break:break-all;">
-                                    ${session.user_agent}
+                                    ${escapeHtml(session.user_agent)}
                                 </span>
                             </div>
                         </td>
-                        <td style="padding: 1rem 0.85rem; font-family:monospace; border-bottom: 1px solid var(--surface-border);">${ipStr}</td>
+                        <td style="padding: 1rem 0.85rem; font-family:monospace; border-bottom: 1px solid var(--surface-border);">${escapeHtml(ipStr)}</td>
                         <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border); font-size:0.8rem;">${createdDate}</td>
                         <td style="padding: 1rem 0.85rem; text-align:right; border-bottom: 1px solid var(--surface-border);">
                             <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
-                                <button class="btn btn-secondary btn-rename-session" data-id="${session.id}" data-name="${escapeHtml(session.name || '')}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
+                                <button class="btn btn-secondary btn-rename-session" data-id="${escapeHtml(session.id)}" data-name="${escapeHtml(session.name || '')}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
                                     Rename
                                 </button>
-                                <button class="${buttonClass} btn-revoke-session" data-id="${session.id}" data-current="${session.is_current}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
+                                <button class="${buttonClass} btn-revoke-session" data-id="${escapeHtml(session.id)}" data-current="${session.is_current}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
                                     Revoke
                                 </button>
                             </div>
@@ -6945,7 +7092,7 @@
                 sessionsListBody.innerHTML = `
                     <tr>
                         <td colspan="5" style="text-align:center; color:var(--danger); padding:2rem 0;">
-                            Failed to load sessions: ${err.message}
+                            Failed to load sessions: ${escapeHtml(err.message)}
                         </td>
                     </tr>
                 `;

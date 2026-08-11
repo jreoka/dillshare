@@ -5,8 +5,8 @@ edition = "2021"
 
 [dependencies]
 axum = "0.7"
-tokio = { version = "1.36", features = ["full"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "limit", "fs"] }
+tokio = { version = "1.36", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 aws-config = { version = "1.1", features = ["behavior-version-latest"] }
@@ -16,7 +16,6 @@ chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-futures-util = "0.3"
 sha2 = "0.10.8"
 hmac = "0.12.1"
 totp-rs = { version = "5.5", features = ["qr", "gen_secret"] }

@@ -100,9 +100,16 @@ self.addEventListener('message', async (event) => {
         const port = event.ports && event.ports[0];
         if (!port) return;
         const streamPath = d.streamPath;
-        const filename = d.filename || 'download';
+        const filename = typeof d.filename === 'string' && d.filename ? d.filename.slice(0, 1024) : 'download';
         const size = d.size;
-        const contentType = d.contentType || 'application/octet-stream';
+        const contentType = typeof d.contentType === 'string' && d.contentType.length <= 255
+            ? d.contentType
+            : 'application/octet-stream';
+        if (typeof streamPath !== 'string' || !streamPath.startsWith(DOWNLOAD_PREFIX) ||
+            (size !== undefined && (!Number.isSafeInteger(size) || size < 0))) {
+            port.postMessage('cancel');
+            return;
+        }
 
         const readable = new ReadableStream({
             start(controller) {
@@ -122,13 +129,32 @@ self.addEventListener('message', async (event) => {
             }
         });
 
-        downloadStreams.set(streamPath, { readable, filename, size, contentType });
+        const expiryTimer = setTimeout(() => {
+            const entry = downloadStreams.get(streamPath);
+            if (entry && entry.readable === readable) {
+                downloadStreams.delete(streamPath);
+                try { port.postMessage('cancel'); } catch (_) {}
+            }
+        }, 30000);
+        downloadStreams.set(streamPath, { readable, filename, size, contentType, expiryTimer });
         if (event.source) event.source.postMessage({ type: 'DILL_DOWNLOAD_READY', streamPath });
         return;
     }
     if (d.type === 'DILL_PREVIEW_INIT') {
-        console.log('[dill-sw] INIT received for', d.streamPath, 'chunked=', d.chunked, 'size=', d.size);
         try {
+            if (typeof d.streamPath !== 'string' || !d.streamPath.startsWith(STREAM_PREFIX) ||
+                !Number.isSafeInteger(d.size) || d.size < 0 || d.size > Number.MAX_SAFE_INTEGER ||
+                !(d.keyRaw instanceof ArrayBuffer || ArrayBuffer.isView(d.keyRaw)) ||
+                new Uint8Array(d.keyRaw.buffer || d.keyRaw, d.keyRaw.byteOffset || 0, d.keyRaw.byteLength).byteLength !== 32 ||
+                typeof d.url !== 'string' || !d.url) {
+                throw new Error('Invalid preview initialization data');
+            }
+            if (d.authUrl) {
+                const authUrl = new URL(d.authUrl, self.location.origin);
+                if (authUrl.origin !== self.location.origin || !authUrl.pathname.startsWith('/api/share/')) {
+                    throw new Error('Invalid preview authorization URL');
+                }
+            }
             if (files.size >= 5) {
                 const firstKey = files.keys().next().value;
                 files.delete(firstKey);
@@ -147,7 +173,6 @@ self.addEventListener('message', async (event) => {
                 chunkCache: new Map(), // Map<chunkIndex, Promise<Uint8Array>>
             };
             files.set(d.streamPath, entry);
-            console.log('[dill-sw] INIT ok, replying READY');
             if (event.source) event.source.postMessage({ type: 'DILL_PREVIEW_READY', streamPath: d.streamPath });
         } catch (e) {
             console.error('[dill-sw] INIT error:', e);
@@ -157,7 +182,7 @@ self.addEventListener('message', async (event) => {
     }
 });
 
-self.addEventListener('install', (event) => {
+self.addEventListener('install', () => {
     // Activate immediately instead of waiting for all tabs to be closed.
     self.skipWaiting();
 });
@@ -185,7 +210,6 @@ self.addEventListener('fetch', (event) => {
         return;
     }
     if (!url.pathname.startsWith(STREAM_PREFIX)) return;
-    console.log('[dill-sw] fetch intercept:', event.request.method, url.pathname, 'range=', event.request.headers.get('Range'));
     event.respondWith(handleStream(event.request, url.pathname));
 });
 
@@ -195,6 +219,7 @@ function handleDownloadStream(streamPath) {
         return new Response('Download stream not found or expired', { status: 404 });
     }
     downloadStreams.delete(streamPath);
+    clearTimeout(entry.expiryTimer);
     const filename = entry.filename;
     const encodedFilename = encodeURIComponent(filename).replace(/['()]/g, escape).replace(/\*/g, '%2A');
     const headers = new Headers({
@@ -202,60 +227,71 @@ function handleDownloadStream(streamPath) {
         'Content-Disposition': `attachment; filename="${encodedFilename}"; filename*=UTF-8''${encodedFilename}`,
         'Cache-Control': 'no-cache, no-store'
     });
-    if (typeof entry.size === 'number' && entry.size > 0) {
+    if (Number.isSafeInteger(entry.size) && entry.size >= 0) {
         headers.set('Content-Length', String(entry.size));
     }
     return new Response(entry.readable, { headers });
 }
 
 async function handleStream(request, streamPath) {
-    console.log('[dill-sw] handleStream', streamPath, 'has meta:', files.has(streamPath));
     const meta = files.get(streamPath);
     if (!meta) {
-        console.error('[dill-sw] handleStream: no meta for', streamPath);
         return new Response('Preview stream not initialized', { status: 503 });
     }
 
     // Determine the plaintext range requested.
     const total = meta.size;
 
-    // HEAD-like request without range: return 200 + full size, no body needed for media probe.
     if (request.method === 'HEAD') {
         return new Response(null, {
             status: 200,
             headers: headHeaders(meta, total),
         });
     }
+    if (request.method !== 'GET') {
+        return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });
+    }
 
     const rangeHeader = request.headers.get('Range');
     let start = 0;
     let end = total; // exclusive
     let isRange = false;
-    if (rangeHeader && rangeHeader.startsWith('bytes=')) {
-        const spec = rangeHeader.slice(6).split(',')[0].trim();
-        // Support byte ranges, open-ended ranges and suffix ranges
-        // (e.g. "bytes=0-99", "bytes=100-", "bytes=-500").
-        const suffix = /^-(\d+)$/.exec(spec);
-        const full = /^(\d+)-(\d*)$/.exec(spec);
-        if (suffix) {
-            const n = parseInt(suffix[1], 10);
-            if (n > 0) {
-                start = Math.max(0, total - n);
-                end = total;
-                isRange = true;
-            }
-        } else if (full) {
-            start = parseInt(full[1], 10);
-            if (full[2] !== '') {
-                end = parseInt(full[2], 10) + 1; // inclusive->exclusive
+    let invalidRange = false;
+    if (rangeHeader) {
+        isRange = true;
+        if (!rangeHeader.startsWith('bytes=') || rangeHeader.includes(',')) {
+            invalidRange = true;
+        } else {
+            const spec = rangeHeader.slice(6).trim();
+            const suffix = /^-(\d+)$/.exec(spec);
+            const full = /^(\d+)-(\d*)$/.exec(spec);
+            if (suffix) {
+                const n = Number(suffix[1]);
+                if (!Number.isSafeInteger(n) || n <= 0 || total === 0) invalidRange = true;
+                else start = Math.max(0, total - n);
+            } else if (full) {
+                start = Number(full[1]);
+                end = full[2] === '' ? total : Number(full[2]) + 1;
+                if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= total || end <= start) {
+                    invalidRange = true;
+                }
             } else {
-                end = total;
+                invalidRange = true;
             }
-            isRange = true;
         }
     }
-    if (end > total) end = total;
-    if (start > end) start = end;
+    if (invalidRange) {
+        return new Response(null, {
+            status: 416,
+            headers: {
+                'Accept-Ranges': 'bytes',
+                'Content-Range': `bytes */${total}`,
+                'Content-Length': '0',
+                'Cache-Control': 'no-store',
+            }
+        });
+    }
+    end = Math.min(end, total);
 
     try {
         if (meta.chunked) {
@@ -383,8 +419,6 @@ async function respondChunkedRange(meta, start, end, isRange) {
         return new Response(null, { status, headers });
     }
 
-    console.log('[dill-sw] respondChunkedRange:', start, '-', end, 'len', totalLength, 'status', status, 'chunks', ranges.length, 'ct', meta.contentType);
-
     // Pipelined prefetch: kick off decryption of the next chunk while the
     // current one is being streamed to the media element. getDecryptedChunk
     // deduplicates via the chunk cache (Map of in-flight promises), so firing a
@@ -395,12 +429,11 @@ async function respondChunkedRange(meta, start, end, isRange) {
     const PREFETCH_AHEAD = 3;
     let aborted = false;
     const streamAc = new AbortController();
-    let chunkIndex = 0;
 
     // Prime the pipeline: start the first PREFETCH_AHEAD fetches immediately so
     // they are already in flight before we begin yielding anything.
     for (let i = 0; i < Math.min(PREFETCH_AHEAD, ranges.length); i++) {
-        getDecryptedChunk(meta, ranges[i], streamAc.signal);
+        getDecryptedChunk(meta, ranges[i], streamAc.signal).catch(() => {});
     }
 
     const stream = new ReadableStream({
@@ -413,7 +446,7 @@ async function respondChunkedRange(meta, start, end, isRange) {
                     // Start fetching the chunk PREFETCH_AHEAD positions ahead so
                     // its network round-trip overlaps the current chunk's decrypt.
                     if (i + PREFETCH_AHEAD < ranges.length) {
-                        getDecryptedChunk(meta, ranges[i + PREFETCH_AHEAD], streamAc.signal);
+                        getDecryptedChunk(meta, ranges[i + PREFETCH_AHEAD], streamAc.signal).catch(() => {});
                     }
 
                     const pt = await getDecryptedChunk(meta, ranges[i], streamAc.signal);
@@ -424,11 +457,9 @@ async function respondChunkedRange(meta, start, end, isRange) {
                         try { controller.enqueue(piece); }
                         catch (_) { break; } // stream closed by consumer mid-enqueue
                     }
-                    console.log('[dill-sw] enqueued chunk', chunkIndex++, 'len', piece.length);
                 }
                 if (!aborted && controller.desiredSize !== null) {
                     controller.close();
-                    console.log('[dill-sw] stream closed, all chunks sent');
                 }
             } catch (err) {
                 if (err.name !== 'AbortError') {

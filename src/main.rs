@@ -4,7 +4,7 @@ use axum::{
     http::header::CONTENT_TYPE,
     http::StatusCode,
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{any, delete, get, post, put},
     Json, Router,
 };
 use base64::Engine;
@@ -15,46 +15,51 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 async fn url_restriction_middleware(
-    axum::extract::Extension(allowed_url): axum::extract::Extension<Option<String>>,
+    axum::extract::Extension(allowed_origin): axum::extract::Extension<Option<String>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, axum::http::StatusCode> {
-    if let Some(url) = allowed_url {
-        let expected_host = url
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .trim_end_matches('/');
-
+    if let Some(origin) = allowed_origin {
+        let expected = webauthn_rs::prelude::Url::parse(&origin)
+            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
         let host = req
             .headers()
             .get(axum::http::header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
+            .and_then(|value| value.to_str().ok())
+            .ok_or(axum::http::StatusCode::FORBIDDEN)?;
+        let authority = host
+            .parse::<axum::http::uri::Authority>()
+            .map_err(|_| axum::http::StatusCode::FORBIDDEN)?;
+        let host_matches = expected
+            .host_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case(authority.host()));
+        let port_matches = authority.port_u16().map_or_else(
+            || expected.port().is_none(),
+            |port| expected.port_or_known_default() == Some(port),
+        );
 
-        let host_without_port = host.split(':').next().unwrap_or("");
-        let expected_without_port = expected_host.split(':').next().unwrap_or("");
-
-        if host_without_port != expected_without_port {
+        if !host_matches || !port_matches {
             tracing::warn!(
-                "Forbidden: Host '{}' does not match allowed URL '{}'",
                 host,
-                url
+                allowed_origin = origin,
+                "Rejected unexpected Host header"
             );
             return Err(axum::http::StatusCode::FORBIDDEN);
         }
 
-        if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
-            if let Ok(origin_str) = origin.to_str() {
-                if origin_str != url
-                    && origin_str.trim_end_matches('/') != url.trim_end_matches('/')
-                {
-                    tracing::warn!(
-                        "Forbidden: Origin '{}' does not match allowed URL '{}'",
-                        origin_str,
-                        url
-                    );
-                    return Err(axum::http::StatusCode::FORBIDDEN);
-                }
+        if let Some(request_origin) = req.headers().get(axum::http::header::ORIGIN) {
+            let request_origin = request_origin
+                .to_str()
+                .map_err(|_| axum::http::StatusCode::FORBIDDEN)?;
+            let parsed = webauthn_rs::prelude::Url::parse(request_origin)
+                .map_err(|_| axum::http::StatusCode::FORBIDDEN)?;
+            if parsed.origin() != expected.origin() {
+                tracing::warn!(
+                    request_origin,
+                    allowed_origin = origin,
+                    "Rejected unexpected Origin header"
+                );
+                return Err(axum::http::StatusCode::FORBIDDEN);
             }
         }
     }
@@ -83,7 +88,7 @@ async fn main() {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "s3_share=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "dillshare=info,tower_http=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -130,29 +135,23 @@ async fn main() {
         )))
     };
 
-    // Verify S3 Connection
-    tracing::info!("Validating S3 connection to bucket '{}'...", bucket);
-    match storage.list_objects(&bucket, None, Some(1)).await {
-        Ok(_) => tracing::info!("S3 connection verified successfully."),
-        Err(e) => {
-            tracing::error!(
-                "WARNING: S3 bucket validation failed! S3 calls may fail. Error: {:?}",
-                e
-            );
-            tracing::error!("Please check your AWS credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION).");
+    if storage.supports_presigning() {
+        tracing::info!("Validating S3 connection to bucket '{}'...", bucket);
+        match storage.list_objects(&bucket, None, Some(1)).await {
+            Ok(_) => tracing::info!("S3 connection verified successfully."),
+            Err(error) => panic!(
+                "S3 bucket validation failed ({error}). Check credentials, region, endpoint, and bucket permissions."
+            )
         }
     }
 
     // Get JWT secret from environment or load/generate in S3
     let jwt_secret = match std::env::var("JWT_SECRET") {
-        Ok(secret_str) => secret_str.into_bytes(),
-        Err(_) => {
-            let secret_key = "config/jwt_secret.bin";
-            match storage.get_object_bytes(&bucket, secret_key).await {
-                Ok(bytes) => bytes,
-                Err(_) => generate_and_save_jwt_secret(&storage, &bucket, secret_key).await,
-            }
-        }
+        Ok(secret_str) if secret_str.len() >= 32 => secret_str.into_bytes(),
+        Ok(_) => panic!("JWT_SECRET must contain at least 32 bytes"),
+        Err(_) => load_or_create_jwt_secret(&storage, &bucket, "config/jwt_secret.bin")
+            .await
+            .unwrap_or_else(|error| panic!("Failed to load or persist JWT secret: {error}")),
     };
 
     let rp_id = std::env::var("RP_ID").unwrap_or_else(|_| "localhost".to_string());
@@ -300,27 +299,41 @@ async fn main() {
         .route("/share/:uuid", get(serve_index))
         .route("/admin", get(serve_index))
         .route("/profile", get(serve_index))
+        .route("/sessions", get(serve_index))
+        // Never turn an unknown API call into a successful HTML response.
+        .route("/api/*path", any(api_not_found))
         .fallback(serve_index)
-        // Router configurations
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        // API payloads are JSON/encrypted profile data; file bytes go directly to S3.
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let allowed_url = std::env::var("URL").ok();
+    let allowed_url = std::env::var("URL").ok().map(|value| {
+        let parsed = webauthn_rs::prelude::Url::parse(&value)
+            .unwrap_or_else(|_| panic!("URL must be a valid absolute http(s) URL"));
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            panic!("URL must contain only an http(s) origin (for example https://example.com)");
+        }
+        parsed.origin().ascii_serialization()
+    });
 
     let app = if let Some(url) = allowed_url.clone() {
         use axum::http::HeaderValue;
         use tower_http::cors::Any;
-        if let Ok(origin) = url.parse::<HeaderValue>() {
-            app.layer(
-                CorsLayer::new()
-                    .allow_origin(origin)
-                    .allow_methods(Any)
-                    .allow_headers(Any),
-            )
-        } else {
-            app.layer(CorsLayer::permissive())
-        }
+        let origin = url
+            .parse::<HeaderValue>()
+            .expect("validated URL origin must be a valid header value");
+        app.layer(
+            CorsLayer::new()
+                .allow_origin(origin)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
     } else {
         app.layer(CorsLayer::permissive())
     };
@@ -422,10 +435,22 @@ async fn passkey_register_finish(
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => vec![],
     };
-    let index_key = format!(
-        "passkey_index/{}",
-        base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(passkey.cred_id())
-    );
+    let credential_id = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(passkey.cred_id());
+    let index_key = format!("passkey_index/{}", credential_id);
+    if passkeys.iter().any(|existing| {
+        base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(existing.cred_id()) == credential_id
+    }) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Passkey is already registered".to_string(),
+        ));
+    }
+    if passkeys.len() >= MAX_PASSKEYS_PER_ACCOUNT {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("At most {MAX_PASSKEYS_PER_ACCOUNT} passkeys may be registered"),
+        ));
+    }
     passkeys.push(passkey);
 
     let passkeys_json = serde_json::to_vec(&passkeys)
@@ -459,7 +484,16 @@ async fn passkey_auth_start(
     State(state): State<AppState>,
     Json(payload): Json<AuthStartPayload>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let username_opt = payload.username.filter(|u| !u.trim().is_empty());
+    let username_opt = payload
+        .username
+        .map(|username| username.trim().to_string())
+        .filter(|username| !username.is_empty());
+    if username_opt
+        .as_deref()
+        .is_some_and(|username| !is_valid_username(username))
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid username".to_string()));
+    }
 
     if let Some(username) = &username_opt {
         let passkeys_key = format!("users/{}/passkeys.json", username);
@@ -481,7 +515,8 @@ async fn passkey_auth_start(
             .start_passkey_authentication(passkeys.as_slice())
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let state_key = format!("users/{}/passkey_auth.json", username);
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let state_key = format!("auth_sessions/{}.json", session_id);
         let state_json = serde_json::to_vec(&auth_state)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         state
@@ -497,7 +532,7 @@ async fn passkey_auth_start(
 
         Ok(Json(serde_json::json!({
             "rcr": rcr,
-            "session_id": username
+            "session_id": session_id
         })))
     } else {
         let (rcr, auth_state) = state
@@ -540,22 +575,21 @@ async fn passkey_auth_finish(
     headers: axum::http::HeaderMap,
     Json(payload): Json<AuthFinishPayload>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let is_discoverable = payload
+    let username_opt = payload
         .username
-        .as_ref()
-        .map_or(true, |u| u.trim().is_empty());
-
-    let state_key = if is_discoverable {
-        format!(
-            "auth_sessions/{}.json",
-            payload.session_id.unwrap_or_default()
-        )
-    } else {
-        format!(
-            "users/{}/passkey_auth.json",
-            payload.username.as_ref().unwrap()
-        )
-    };
+        .as_deref()
+        .map(str::trim)
+        .filter(|username| !username.is_empty());
+    if username_opt.is_some_and(|username| !is_valid_username(username)) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid username".to_string()));
+    }
+    let is_discoverable = username_opt.is_none();
+    let session_id = payload
+        .session_id
+        .as_deref()
+        .filter(|session_id| is_canonical_uuid(session_id))
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid auth session".to_string()))?;
+    let state_key = format!("auth_sessions/{}.json", session_id);
 
     let state_bytes = state
         .storage
@@ -650,7 +684,7 @@ async fn passkey_auth_finish(
             .webauthn
             .finish_passkey_authentication(&payload.auth, &auth_state)
             .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
-        (payload.username.unwrap(), auth_res)
+        (username_opt.unwrap().to_string(), auth_res)
     };
 
     let passkeys_key = format!("users/{}/passkeys.json", username);
@@ -669,8 +703,9 @@ async fn passkey_auth_finish(
             break;
         }
     }
-    let passkeys_json = serde_json::to_vec(&passkeys).unwrap();
-    let _ = state
+    let passkeys_json = serde_json::to_vec(&passkeys)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    state
         .storage
         .put_object(
             &state.bucket,
@@ -678,7 +713,8 @@ async fn passkey_auth_finish(
             passkeys_json,
             Some("application/json"),
         )
-        .await;
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     // Check 2FA before finalizing
     let user_key = format!("users/{}.json", username);
@@ -706,21 +742,8 @@ async fn passkey_auth_finish(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if let Some(code) = &payload.totp_code {
-            if let Ok(secret) = totp_rs::Secret::Encoded(totp_secret.to_string()).to_bytes() {
-                let totp = totp_rs::TOTP::new(
-                    totp_rs::Algorithm::SHA1,
-                    6,
-                    1,
-                    30,
-                    secret,
-                    Some("DillShare".to_string()),
-                    username.to_string(),
-                )
-                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "2FA Error".to_string()))?;
-
-                if !totp.check_current(code).unwrap_or(false) {
-                    return Err((StatusCode::FORBIDDEN, "INVALID_2FA".to_string()));
-                }
+            if !verify_totp_code(totp_secret, &username, code)? {
+                return Err((StatusCode::FORBIDDEN, "INVALID_2FA".to_string()));
             }
         } else {
             return Err((StatusCode::FORBIDDEN, "2FA_REQUIRED".to_string()));
@@ -743,17 +766,7 @@ async fn passkey_auth_finish(
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => vec![],
     };
-    let user_agent = headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("Unknown")
-        .to_string();
-    let ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
-        .unwrap_or("Unknown")
-        .to_string();
+    let (user_agent, ip) = request_client_metadata(&headers);
 
     sessions.push(UserSession {
         id: session_id,
@@ -763,9 +776,14 @@ async fn passkey_auth_finish(
         user_agent,
         name: None,
     });
+    if sessions.len() > MAX_SESSIONS_PER_ACCOUNT {
+        sessions.sort_by_key(|session| session.created_at);
+        sessions.drain(..sessions.len() - MAX_SESSIONS_PER_ACCOUNT);
+    }
 
-    let sessions_json = serde_json::to_vec(&sessions).unwrap();
-    let _ = state
+    let sessions_json = serde_json::to_vec(&sessions)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    state
         .storage
         .put_object(
             &state.bucket,
@@ -773,7 +791,8 @@ async fn passkey_auth_finish(
             sessions_json,
             Some("application/json"),
         )
-        .await;
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     let pfp_enc = fetch_user_pfp_enc(&state, &username).await;
 
@@ -860,10 +879,14 @@ async fn delete_user_passkey(
     };
 
     use base64::Engine;
+    let original_len = passkeys.len();
     passkeys.retain(|pk| {
         let pk_id = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(pk.cred_id());
         pk_id != id
     });
+    if passkeys.len() == original_len {
+        return Err((StatusCode::NOT_FOUND, "Passkey not found".to_string()));
+    }
 
     let passkeys_json = serde_json::to_vec(&passkeys)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -877,6 +900,11 @@ async fn delete_user_passkey(
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let _ = state
+        .storage
+        .delete_object(&state.bucket, &format!("passkey_index/{}", id))
+        .await;
 
     let meta_key = format!("users/{}/passkeys_meta.json", username);
     if let Ok(bytes) = state
@@ -921,6 +949,28 @@ async fn rename_user_passkey(
         .await
         .ok_or((StatusCode::UNAUTHORIZED, "Invalid token".into()))?;
 
+    let name = payload.name.trim().chars().take(64).collect::<String>();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Passkey name cannot be empty".to_string(),
+        ));
+    }
+    let passkeys_key = format!("users/{}/passkeys.json", username);
+    let passkeys: Vec<webauthn_rs::prelude::Passkey> = state
+        .storage
+        .get_object_bytes(&state.bucket, &passkeys_key)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    if !passkeys
+        .iter()
+        .any(|passkey| base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(passkey.cred_id()) == id)
+    {
+        return Err((StatusCode::NOT_FOUND, "Passkey not found".to_string()));
+    }
+
     let meta_key = format!("users/{}/passkeys_meta.json", username);
     let mut meta_map: std::collections::HashMap<String, PasskeyMeta> = match state
         .storage
@@ -931,7 +981,7 @@ async fn rename_user_passkey(
         Err(_) => std::collections::HashMap::new(),
     };
 
-    meta_map.insert(id, PasskeyMeta { name: payload.name });
+    meta_map.insert(id, PasskeyMeta { name });
 
     let meta_json = serde_json::to_vec(&meta_map)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -949,9 +999,21 @@ async fn rename_user_passkey(
     Ok(Json(serde_json::json!({"success": true})))
 }
 
-// Serve embedded single page app index.html
+async fn api_not_found() -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, "API endpoint not found")
+}
+
+// Serve the embedded SPA without caching HTML across binary upgrades.
 async fn serve_index() -> impl IntoResponse {
-    Html(include_str!("index.html"))
+    (
+        [
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+            (axum::http::header::X_FRAME_OPTIONS, "DENY"),
+        ],
+        Html(include_str!("index.html")),
+    )
 }
 
 // Serve the streaming-preview service worker. The browser requires this to be
@@ -1039,6 +1101,73 @@ const ENCRYPTION_OVERHEAD_BYTES: i64 = 28;
 const MAX_FILES_PER_SHARE: usize = 1_000;
 const METADATA_MAX_BYTES: i64 = 8 * 1024 * 1024;
 const THUMBNAIL_MAX_BYTES: i64 = 2 * 1024 * 1024;
+// Hex encoding doubles request size; keep this below the 16 MiB JSON body cap.
+const USER_DATA_MAX_BYTES: usize = 7 * 1024 * 1024;
+const MAX_SESSIONS_PER_ACCOUNT: usize = 100;
+const MAX_PASSKEYS_PER_ACCOUNT: usize = 20;
+
+fn is_valid_username(username: &str) -> bool {
+    (3..=30).contains(&username.len())
+        && username
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn is_valid_auth_key(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn decode_hex(value: &str, maximum_bytes: usize) -> Result<Vec<u8>, (StatusCode, String)> {
+    if !value.len().is_multiple_of(2) || value.len() / 2 > maximum_bytes {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid or oversized encrypted payload".to_string(),
+        ));
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid encrypted payload hex encoding".to_string(),
+                )
+            })?;
+            u8::from_str_radix(pair, 16).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid encrypted payload hex encoding".to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn request_client_metadata(headers: &axum::http::HeaderMap) -> (String, String) {
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("Unknown")
+        .chars()
+        .take(512)
+        .collect();
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+        })
+        .unwrap_or("Unknown")
+        .trim()
+        .chars()
+        .take(64)
+        .collect();
+    (user_agent, ip)
+}
 
 fn encrypted_file_size(plaintext_size: i64) -> Option<i64> {
     if plaintext_size < 0 {
@@ -1068,9 +1197,9 @@ fn multipart_part_sizes(plaintext_size: i64) -> Option<Vec<i64>> {
     } else {
         2usize
     };
-    chunks_per_part = chunks_per_part.max((total_chunks + 8_999) / 9_000);
+    chunks_per_part = chunks_per_part.max(total_chunks.div_ceil(9_000));
 
-    let mut sizes = Vec::with_capacity((total_chunks + chunks_per_part - 1) / chunks_per_part);
+    let mut sizes = Vec::with_capacity(total_chunks.div_ceil(chunks_per_part));
     for start_chunk in (0..total_chunks).step_by(chunks_per_part) {
         let end_chunk = (start_chunk + chunks_per_part).min(total_chunks);
         let mut part_size = 0i64;
@@ -1123,10 +1252,12 @@ fn is_valid_sha256_checksum(value: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_canonical_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.hyphenated().to_string() == value)
+}
+
 fn validate_upload_uuid(value: &str) -> Result<(), (StatusCode, String)> {
-    let parsed = uuid::Uuid::parse_str(value)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid upload ID".to_string()))?;
-    if parsed.hyphenated().to_string() != value {
+    if !is_canonical_uuid(value) {
         return Err((StatusCode::BAD_REQUEST, "Invalid upload ID".to_string()));
     }
     Ok(())
@@ -2308,12 +2439,14 @@ async fn upload_multipart_part_url(
     let request = state
         .storage
         .presign_upload_part(
-            &state.bucket,
-            &key,
-            &payload.upload_id,
-            payload.part_number,
-            payload.content_length,
-            &payload.checksum_sha256,
+            storage::UploadPartRequest {
+                bucket: &state.bucket,
+                key: &key,
+                upload_id: &payload.upload_id,
+                part_number: payload.part_number,
+                content_length: payload.content_length,
+                checksum_sha256: &payload.checksum_sha256,
+            },
             state.presign_ttl,
         )
         .await
@@ -2812,6 +2945,8 @@ async fn delete_share(
         )
     })?;
 
+    validate_upload_uuid(&uuid)?;
+
     // Check ownership
     let owner_key = format!("uploads/{}/owner.txt", uuid);
     let owner_res = state
@@ -2820,21 +2955,12 @@ async fn delete_share(
         .await;
 
     let owner = match owner_res {
-        Ok(bytes) => {
-            if true {
-                String::from_utf8(bytes.to_vec())
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string()
-            } else {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    "Share has no valid owner recorded".to_string(),
-                ));
-            }
-        }
+        Ok(bytes) => String::from_utf8(bytes)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
         Err(_) => {
-            return Err((StatusCode::FORBIDDEN, "Cannot verify ownership".to_string()));
+            return Err((StatusCode::NOT_FOUND, "Share not found".to_string()));
         }
     };
 
@@ -2939,10 +3065,7 @@ async fn perform_cleanup(
     storage: &storage::Storage,
     bucket: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = chrono::Utc::now().timestamp();
 
     let share_expiry_days = std::env::var("DILLSHARE_EXPIRE_DAYS")
         .ok()
@@ -3089,12 +3212,10 @@ async fn perform_cleanup(
                 if now - created_at <= partial_upload_limit {
                     continue;
                 }
-                if marker.status == "finishing" {
-                    // A finisher already owns the CAS claim. Never delete from a
-                    // stale pre-owner listing while that operation may be running.
-                    continue;
-                }
-                if marker.status == "active" {
+                if marker.status == "active" || marker.status == "finishing" {
+                    // Once the hard session lifetime has elapsed, even a crashed
+                    // finisher must be reclaimable. CAS prevents racing a marker
+                    // that changed after this cleanup worker read it.
                     let e_tag = match active_info.e_tag {
                         Some(e_tag) => e_tag,
                         None => continue,
@@ -3162,12 +3283,11 @@ async fn perform_cleanup(
     // Cleanup old user passkey states
     if let Ok(users) = storage.list_objects(bucket, Some("users/"), None).await {
         for object in users {
-            if object.key.ends_with("/passkey_reg.json")
-                || object.key.ends_with("/passkey_auth.json")
+            if (object.key.ends_with("/passkey_reg.json")
+                || object.key.ends_with("/passkey_auth.json"))
+                && now - object.last_modified_secs > partial_upload_limit
             {
-                if now - object.last_modified_secs > partial_upload_limit {
-                    keys_to_delete.push(object.key);
-                }
+                keys_to_delete.push(object.key);
             }
         }
     }
@@ -3306,43 +3426,64 @@ struct SaveSharesRequest {
     shares_enc: String,
 }
 
+fn verify_totp_code(
+    secret: &str,
+    username: &str,
+    code: &str,
+) -> Result<bool, (StatusCode, String)> {
+    if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(false);
+    }
+    let secret = totp_rs::Secret::Encoded(secret.to_string())
+        .to_bytes()
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid 2FA configuration".to_string(),
+            )
+        })?;
+    let totp = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret,
+        Some("DillShare".to_string()),
+        username.to_string(),
+    )
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid 2FA configuration".to_string(),
+        )
+    })?;
+    totp.check_current(code).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "2FA verification failed".to_string(),
+        )
+    })
+}
+
 async fn register_user(
     State(state): State<AppState>,
     axum::Json(payload): axum::Json<AuthRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let username = payload.username.trim();
-    if username.is_empty() || username.len() < 3 || username.len() > 30 {
+    if !is_valid_username(username) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Username must be between 3 and 30 characters".to_string(),
+            "Username must be 3-30 letters, numbers, dashes, or underscores".to_string(),
         ));
     }
-
-    if !username
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
+    if !is_valid_auth_key(&payload.auth_key) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Username can only contain letters, numbers, dashes, and underscores".to_string(),
+            "Invalid authentication key".to_string(),
         ));
     }
 
     let user_key = format!("users/{}.json", username);
-
-    // Check if user already exists
-    let user_exists = state
-        .storage
-        .head_object(&state.bucket, &user_key)
-        .await
-        .unwrap_or(false);
-
-    if user_exists {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Username is already taken".to_string(),
-        ));
-    }
 
     // Hash the auth_key with a server salt
     let mut hasher = Sha256::new();
@@ -3356,24 +3497,31 @@ async fn register_user(
     let user_bytes = serde_json::to_vec(&user_data)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Save to S3
-    state
+    // A conditional write prevents concurrent registrations from overwriting
+    // one another after a check-then-write race.
+    let created = state
         .storage
-        .put_object(
+        .put_object_if_absent(
             &state.bucket,
             &user_key,
-            user_bytes.into(),
+            user_bytes,
             Some("application/json"),
         )
         .await
-        .map_err(|e| {
+        .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to save user: {:?}", e),
+                format!("Failed to save user: {error}"),
             )
         })?;
+    if !created {
+        return Err((
+            StatusCode::CONFLICT,
+            "Username is already taken".to_string(),
+        ));
+    }
 
-    Ok(StatusCode::OK)
+    Ok(StatusCode::CREATED)
 }
 
 async fn login_user(
@@ -3382,6 +3530,12 @@ async fn login_user(
     axum::Json(payload): axum::Json<AuthRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let username = payload.username.trim();
+    if !is_valid_username(username) || !is_valid_auth_key(&payload.auth_key) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid username or password".to_string(),
+        ));
+    }
     let user_key = format!("users/{}.json", username);
 
     // Retrieve user data from S3
@@ -3414,7 +3568,7 @@ async fn login_user(
     hasher.update(b"server-salt-dill-share");
     let computed_hash = format!("{:02x}", hasher.finalize());
 
-    if computed_hash != stored_hash {
+    if !secure_equal(computed_hash.as_bytes(), stored_hash.as_bytes()) {
         return Err((
             StatusCode::UNAUTHORIZED,
             "Invalid username or password".to_string(),
@@ -3431,21 +3585,8 @@ async fn login_user(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if let Some(code) = &payload.totp_code {
-            if let Ok(secret) = totp_rs::Secret::Encoded(totp_secret.to_string()).to_bytes() {
-                let totp = totp_rs::TOTP::new(
-                    totp_rs::Algorithm::SHA1,
-                    6,
-                    1,
-                    30,
-                    secret,
-                    Some("DillShare".to_string()),
-                    username.to_string(),
-                )
-                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "2FA Error".to_string()))?;
-
-                if !totp.check_current(code).unwrap_or(false) {
-                    return Err((StatusCode::FORBIDDEN, "INVALID_2FA".to_string()));
-                }
+            if !verify_totp_code(totp_secret, username, code)? {
+                return Err((StatusCode::FORBIDDEN, "INVALID_2FA".to_string()));
             }
         } else {
             return Err((StatusCode::FORBIDDEN, "2FA_REQUIRED".to_string()));
@@ -3457,18 +3598,7 @@ async fn login_user(
     let expiry = 0;
     let token = generate_token(username, &state.jwt_secret, expiry, &session_id);
 
-    // Extract user agent and IP
-    let user_agent = headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("Unknown")
-        .to_string();
-    let ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
-        .unwrap_or("Unknown")
-        .to_string();
+    let (user_agent, ip) = request_client_metadata(&headers);
 
     let new_session = UserSession {
         id: session_id,
@@ -3485,17 +3615,15 @@ async fn login_user(
         .get_object_bytes(&state.bucket, &sessions_key)
         .await
     {
-        Ok(bytes) => {
-            if true {
-                serde_json::from_slice(&bytes).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
 
     sessions.push(new_session);
+    if sessions.len() > MAX_SESSIONS_PER_ACCOUNT {
+        sessions.sort_by_key(|session| session.created_at);
+        sessions.drain(..sessions.len() - MAX_SESSIONS_PER_ACCOUNT);
+    }
 
     if let Ok(session_bytes) = serde_json::to_vec(&sessions) {
         let _ = state
@@ -3503,7 +3631,7 @@ async fn login_user(
             .put_object(
                 &state.bucket,
                 &sessions_key,
-                session_bytes.into(),
+                session_bytes,
                 Some("application/json"),
             )
             .await;
@@ -3567,22 +3695,7 @@ async fn save_user_shares(
         )
     })?;
 
-    // Decode hex string back to bytes
-    let mut bytes = Vec::new();
-    let shares_hex = payload.shares_enc.trim();
-    for i in (0..shares_hex.len()).step_by(2) {
-        if i + 2 > shares_hex.len() {
-            break;
-        }
-        let byte_str = &shares_hex[i..i + 2];
-        let byte = u8::from_str_radix(byte_str, 16).map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                "Invalid encrypted payload hex encoding".to_string(),
-            )
-        })?;
-        bytes.push(byte);
-    }
+    let bytes = decode_hex(payload.shares_enc.trim(), USER_DATA_MAX_BYTES)?;
 
     let shares_key = format!("users/{}/shares.enc", username);
 
@@ -3623,17 +3736,33 @@ fn extract_token(headers: &axum::http::HeaderMap) -> Result<String, (StatusCode,
         )
     })?;
 
-    if !auth_str.starts_with("Bearer ") {
-        return Err((
+    let token = auth_str.strip_prefix("Bearer ").ok_or_else(|| {
+        (
             StatusCode::UNAUTHORIZED,
             "Authorization scheme must be Bearer".to_string(),
-        ));
+        )
+    })?;
+    if token.is_empty() || token.len() > 4096 {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
     }
 
-    Ok(auth_str[7..].to_string())
+    Ok(token.to_string())
 }
 
 type HmacSha256 = Hmac<Sha256>;
+
+fn secure_equal(left: &[u8], right: &[u8]) -> bool {
+    let Ok(mut left_mac) = HmacSha256::new_from_slice(left) else {
+        return false;
+    };
+    left_mac.update(b"dillshare constant-time comparison");
+    let expected = left_mac.finalize().into_bytes();
+    let Ok(mut right_mac) = HmacSha256::new_from_slice(right) else {
+        return false;
+    };
+    right_mac.update(b"dillshare constant-time comparison");
+    right_mac.verify_slice(&expected).is_ok()
+}
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct UserSession {
@@ -3685,32 +3814,23 @@ fn verify_token_signature(token: &str, secret: &[u8]) -> Option<(String, i64, St
 
     let expiry_timestamp = expiry_str.parse::<i64>().ok()?;
 
-    let mut username_bytes = Vec::new();
-    for i in (0..username_hex.len()).step_by(2) {
-        if i + 2 > username_hex.len() {
-            break;
-        }
-        let byte_str = &username_hex[i..i + 2];
-        let byte = u8::from_str_radix(byte_str, 16).ok()?;
-        username_bytes.push(byte);
+    let username = String::from_utf8(decode_hex(username_hex, 128).ok()?).ok()?;
+    if !is_valid_username(&username) || !is_canonical_uuid(session_id) {
+        return None;
     }
-    let username = String::from_utf8(username_bytes).ok()?;
+    if expiry_timestamp != 0 && chrono::Utc::now().timestamp() >= expiry_timestamp {
+        return None;
+    }
+    let signature = decode_hex(signature, 32).ok()?;
+    if signature.len() != 32 {
+        return None;
+    }
 
     let payload = format!("{}:{}:{}", username, expiry_timestamp, session_id);
     let mut mac = HmacSha256::new_from_slice(secret).ok()?;
     mac.update(payload.as_bytes());
-    let expected_sig = mac
-        .finalize()
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>();
-
-    if expected_sig == signature {
-        Some((username, expiry_timestamp, session_id.to_string()))
-    } else {
-        None
-    }
+    mac.verify_slice(&signature).ok()?;
+    Some((username, expiry_timestamp, session_id.to_string()))
 }
 
 async fn verify_session(token: &str, state: &AppState) -> Option<(String, String)> {
@@ -3760,7 +3880,9 @@ async fn admin_get_stats(
                     .strip_suffix(".json")
                     .unwrap_or(relative)
                     .to_string();
-                users_list.push(username);
+                if is_valid_username(&username) {
+                    users_list.push(username);
+                }
             }
         }
     }
@@ -3775,11 +3897,7 @@ async fn admin_get_stats(
             .await
         {
             Ok(bytes) => {
-                if true {
-                    serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default()
-                } else {
-                    Vec::new()
-                }
+                serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default()
             }
             Err(_) => Vec::new(),
         };
@@ -3825,6 +3943,7 @@ async fn admin_delete_share(
     Path(uuid): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     verify_admin(&headers, &state).await?;
+    validate_upload_uuid(&uuid)?;
 
     let owner_key = format!("uploads/{}/owner.txt", uuid);
     let owner_res = state
@@ -3833,16 +3952,10 @@ async fn admin_delete_share(
         .await;
 
     let owner = match owner_res {
-        Ok(bytes) => {
-            if true {
-                String::from_utf8(bytes.to_vec())
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string()
-            } else {
-                String::new()
-            }
-        }
+        Ok(bytes) => String::from_utf8(bytes)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
         Err(_) => String::new(),
     };
 
@@ -3857,22 +3970,19 @@ async fn admin_delete_share(
             .await
         {
             for object in response {
-                if true {
-                    let key = &object;
-                    if key.key.ends_with("/public_shares.json") {
-                        if let Some(user_part) = key
-                            .key
-                            .strip_prefix("users/")
-                            .and_then(|k| k.strip_suffix("/public_shares.json"))
-                        {
-                            remove_share_from_user_index(
-                                &state.storage,
-                                &state.bucket,
-                                user_part,
-                                &uuid,
-                            )
-                            .await;
-                        }
+                if object.key.ends_with("/public_shares.json") {
+                    if let Some(user_part) = object
+                        .key
+                        .strip_prefix("users/")
+                        .and_then(|key| key.strip_suffix("/public_shares.json"))
+                    {
+                        remove_share_from_user_index(
+                            &state.storage,
+                            &state.bucket,
+                            user_part,
+                            &uuid,
+                        )
+                        .await;
                     }
                 }
             }
@@ -3890,8 +4000,8 @@ async fn admin_delete_user(
     verify_admin(&headers, &state).await?;
 
     let username = username.trim();
-    if username.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Username is empty".to_string()));
+    if !is_valid_username(username) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid username".to_string()));
     }
 
     let public_shares_key = format!("users/{}/public_shares.json", username);
@@ -3900,12 +4010,14 @@ async fn admin_delete_user(
         .get_object_bytes(&state.bucket, &public_shares_key)
         .await
     {
-        if true {
-            if let Ok(shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
-                for share in shares {
-                    if let Some(uuid) = share.get("uuid").and_then(|u| u.as_str()) {
-                        let _ = delete_share_objects(&state.storage, &state.bucket, uuid).await;
-                    }
+        if let Ok(shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
+            for share in shares {
+                if let Some(uuid) = share
+                    .get("uuid")
+                    .and_then(|value| value.as_str())
+                    .filter(|uuid| is_canonical_uuid(uuid))
+                {
+                    delete_share_objects(&state.storage, &state.bucket, uuid).await?;
                 }
             }
         }
@@ -3914,11 +4026,12 @@ async fn admin_delete_user(
     let user_profile_key = format!("users/{}.json", username);
     let user_folder_prefix = format!("users/{}/", username);
 
-    let _ = state
+    state
         .storage
         .delete_object(&state.bucket, &user_profile_key)
-        .await;
-    let _ = delete_s3_prefix(&state.storage, &state.bucket, &user_folder_prefix).await;
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    delete_s3_prefix(&state.storage, &state.bucket, &user_folder_prefix).await?;
 
     Ok(StatusCode::OK)
 }
@@ -3940,27 +4053,29 @@ async fn verify_admin_session(token: &str, state: &AppState) -> bool {
         .await;
 
     match res {
-        Ok(bytes) => {
-            if true {
-                let sessions: Vec<UserSession> = match serde_json::from_slice(&bytes) {
-                    Ok(s) => s,
-                    Err(_) => return false,
-                };
-                sessions.iter().any(|s| s.id == session_id)
-            } else {
-                false
-            }
-        }
+        Ok(bytes) => serde_json::from_slice::<Vec<UserSession>>(&bytes)
+            .is_ok_and(|sessions| sessions.iter().any(|session| session.id == session_id)),
         Err(_) => false,
     }
+}
+
+fn admin_bootstrap_secret() -> Result<String, (StatusCode, String)> {
+    let secret = std::env::var("ADMIN_TOKEN")
+        .map_err(|_| (StatusCode::FORBIDDEN, "Admin panel is disabled".to_string()))?;
+    if secret.len() < 32 {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ADMIN_TOKEN must contain at least 32 bytes".to_string(),
+        ));
+    }
+    Ok(secret)
 }
 
 async fn verify_admin(
     headers: &axum::http::HeaderMap,
     state: &AppState,
 ) -> Result<(), (StatusCode, String)> {
-    let admin_token_env = std::env::var("ADMIN_TOKEN")
-        .map_err(|_| (StatusCode::FORBIDDEN, "Admin panel is disabled".to_string()))?;
+    let admin_token_env = admin_bootstrap_secret()?;
 
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -3986,7 +4101,7 @@ async fn verify_admin(
     }
 
     let token = &auth_str[7..];
-    if token == admin_token_env {
+    if secure_equal(token.as_bytes(), admin_token_env.as_bytes()) {
         return Ok(());
     }
 
@@ -4037,14 +4152,10 @@ async fn fetch_user_pfp_enc(state: &AppState, username: &str) -> String {
         .get_object_bytes(&state.bucket, &pfp_key)
         .await
     {
-        Ok(bytes) => {
-            if true {
-                let vec = bytes;
-                vec.iter().map(|b| format!("{:02x}", b)).collect::<String>()
-            } else {
-                String::new()
-            }
-        }
+        Ok(bytes) => bytes
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect::<String>(),
         Err(_) => String::new(),
     }
 }
@@ -4070,13 +4181,11 @@ async fn get_user_profile(
         .get_object_bytes(&state.bucket, &user_key)
         .await
     {
-        if true {
-            if let Ok(user_json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                totp_enabled = user_json
-                    .get("totp_enabled")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-            }
+        if let Ok(user_json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            totp_enabled = user_json
+                .get("totp_enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
         }
     }
 
@@ -4116,21 +4225,19 @@ async fn save_user_profile(
         .get_object_bytes(&state.bucket, &user_key)
         .await
     {
-        if true {
-            if let Ok(mut user_json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if let Some(obj) = user_json.as_object_mut() {
-                    if obj.remove("pfp").is_some() {
-                        if let Ok(user_bytes) = serde_json::to_vec(&user_json) {
-                            let _ = state
-                                .storage
-                                .put_object(
-                                    &state.bucket,
-                                    &user_key,
-                                    user_bytes.into(),
-                                    Some("application/json"),
-                                )
-                                .await;
-                        }
+        if let Ok(mut user_json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(object) = user_json.as_object_mut() {
+                if object.remove("pfp").is_some() {
+                    if let Ok(user_bytes) = serde_json::to_vec(&user_json) {
+                        let _ = state
+                            .storage
+                            .put_object(
+                                &state.bucket,
+                                &user_key,
+                                user_bytes,
+                                Some("application/json"),
+                            )
+                            .await;
                     }
                 }
             }
@@ -4148,28 +4255,7 @@ async fn save_user_profile(
     if hex_data.trim().is_empty() {
         let _ = state.storage.delete_object(&state.bucket, &pfp_key).await;
     } else {
-        let mut bytes = Vec::new();
-        let hex_str = hex_data.trim();
-        for i in (0..hex_str.len()).step_by(2) {
-            if i + 2 > hex_str.len() {
-                break;
-            }
-            let byte_str = &hex_str[i..i + 2];
-            let byte = u8::from_str_radix(byte_str, 16).map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "Invalid encrypted payload hex encoding".to_string(),
-                )
-            })?;
-            bytes.push(byte);
-        }
-
-        if bytes.len() > 12_000_000 {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Profile picture too large".to_string(),
-            ));
-        }
+        let bytes = decode_hex(hex_data.trim(), USER_DATA_MAX_BYTES)?;
 
         state
             .storage
@@ -4213,6 +4299,21 @@ async fn user_change_password(
         )
     })?;
 
+    if !is_valid_auth_key(&payload.current_auth_key) || !is_valid_auth_key(&payload.new_auth_key) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid authentication key".to_string(),
+        ));
+    }
+    // Validate every encrypted replacement before changing any stored value.
+    let new_shares_bytes = decode_hex(payload.new_shares_enc.trim(), USER_DATA_MAX_BYTES)?;
+    let new_pfp_bytes = payload
+        .new_pfp_enc
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| decode_hex(value.trim(), USER_DATA_MAX_BYTES))
+        .transpose()?;
+
     let user_key = format!("users/{}.json", username);
 
     let bytes = state
@@ -4238,7 +4339,7 @@ async fn user_change_password(
     hasher.update(b"server-salt-dill-share");
     let computed_hash = format!("{:02x}", hasher.finalize());
 
-    if computed_hash != stored_hash {
+    if !secure_equal(computed_hash.as_bytes(), stored_hash.as_bytes()) {
         return Err((
             StatusCode::UNAUTHORIZED,
             "Incorrect current password".to_string(),
@@ -4265,7 +4366,7 @@ async fn user_change_password(
         .put_object(
             &state.bucket,
             &user_key,
-            user_bytes.into(),
+            user_bytes,
             Some("application/json"),
         )
         .await
@@ -4276,21 +4377,7 @@ async fn user_change_password(
             )
         })?;
 
-    let mut enc_bytes = Vec::new();
-    let shares_hex = payload.new_shares_enc.trim();
-    for i in (0..shares_hex.len()).step_by(2) {
-        if i + 2 > shares_hex.len() {
-            break;
-        }
-        let byte_str = &shares_hex[i..i + 2];
-        let byte = u8::from_str_radix(byte_str, 16).map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                "Invalid encrypted payload hex encoding".to_string(),
-            )
-        })?;
-        enc_bytes.push(byte);
-    }
+    let enc_bytes = new_shares_bytes;
 
     let shares_key = format!("users/{}/shares.enc", username);
     state
@@ -4314,18 +4401,13 @@ async fn user_change_password(
         if new_pfp.trim().is_empty() {
             let _ = state.storage.delete_object(&state.bucket, &pfp_key).await;
         } else {
-            let mut bytes = Vec::new();
-            let hex_str = new_pfp.trim();
-            for i in (0..hex_str.len()).step_by(2) {
-                if i + 2 > hex_str.len() {
-                    break;
-                }
-                let byte_str = &hex_str[i..i + 2];
-                if let Ok(byte) = u8::from_str_radix(byte_str, 16) {
-                    bytes.push(byte);
-                }
-            }
-            let _ = state
+            let bytes = new_pfp_bytes.clone().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid profile picture".to_string(),
+                )
+            })?;
+            state
                 .storage
                 .put_object(
                     &state.bucket,
@@ -4333,7 +4415,13 @@ async fn user_change_password(
                     bytes,
                     Some("application/octet-stream"),
                 )
-                .await;
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to save new profile picture: {error}"),
+                    )
+                })?;
         }
     }
 
@@ -4344,13 +4432,7 @@ async fn user_change_password(
         .get_object_bytes(&state.bucket, &sessions_key)
         .await
     {
-        Ok(bytes) => {
-            if true {
-                serde_json::from_slice(&bytes).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
 
@@ -4362,7 +4444,7 @@ async fn user_change_password(
             .put_object(
                 &state.bucket,
                 &sessions_key,
-                session_bytes.into(),
+                session_bytes,
                 Some("application/json"),
             )
             .await;
@@ -4389,12 +4471,14 @@ async fn user_delete_account(
         .get_object_bytes(&state.bucket, &public_shares_key)
         .await
     {
-        if true {
-            if let Ok(shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
-                for share in shares {
-                    if let Some(uuid) = share.get("uuid").and_then(|u| u.as_str()) {
-                        let _ = delete_share_objects(&state.storage, &state.bucket, uuid).await;
-                    }
+        if let Ok(shares) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
+            for share in shares {
+                if let Some(uuid) = share
+                    .get("uuid")
+                    .and_then(|value| value.as_str())
+                    .filter(|uuid| is_canonical_uuid(uuid))
+                {
+                    delete_share_objects(&state.storage, &state.bucket, uuid).await?;
                 }
             }
         }
@@ -4403,27 +4487,45 @@ async fn user_delete_account(
     let user_profile_key = format!("users/{}.json", username);
     let user_folder_prefix = format!("users/{}/", username);
 
-    let _ = state
+    state
         .storage
         .delete_object(&state.bucket, &user_profile_key)
-        .await;
-    let _ = delete_s3_prefix(&state.storage, &state.bucket, &user_folder_prefix).await;
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    delete_s3_prefix(&state.storage, &state.bucket, &user_folder_prefix).await?;
 
     Ok(StatusCode::OK)
 }
 
-async fn generate_and_save_jwt_secret(
+async fn load_or_create_jwt_secret(
     storage: &storage::Storage,
     bucket: &str,
     key: &str,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, String> {
+    if storage.head_object_info(bucket, key).await?.is_some() {
+        let secret = storage.get_object_bytes(bucket, key).await?;
+        if secret.len() < 32 {
+            return Err("persisted JWT secret is too short".to_string());
+        }
+        return Ok(secret);
+    }
+
     let mut secret = [0u8; 32];
     use rand::Rng;
     rand::rng().fill_bytes(&mut secret);
-
-    let _ = storage.put_object(bucket, key, secret.to_vec(), None).await;
-
-    secret.to_vec()
+    if storage
+        .put_object_if_absent(bucket, key, secret.to_vec(), None)
+        .await?
+    {
+        Ok(secret.to_vec())
+    } else {
+        let existing = storage.get_object_bytes(bucket, key).await?;
+        if existing.len() < 32 {
+            Err("persisted JWT secret is too short".to_string())
+        } else {
+            Ok(existing)
+        }
+    }
 }
 
 async fn get_user_sessions(
@@ -4444,13 +4546,7 @@ async fn get_user_sessions(
         .get_object_bytes(&state.bucket, &sessions_key)
         .await
     {
-        Ok(bytes) => {
-            if true {
-                serde_json::from_slice(&bytes).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
 
@@ -4492,13 +4588,7 @@ async fn revoke_user_session(
         .get_object_bytes(&state.bucket, &sessions_key)
         .await
     {
-        Ok(bytes) => {
-            if true {
-                serde_json::from_slice(&bytes).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
 
@@ -4514,7 +4604,7 @@ async fn revoke_user_session(
             .put_object(
                 &state.bucket,
                 &sessions_key,
-                session_bytes.into(),
+                session_bytes,
                 Some("application/json"),
             )
             .await
@@ -4555,13 +4645,7 @@ async fn rename_user_session(
         .get_object_bytes(&state.bucket, &sessions_key)
         .await
     {
-        Ok(bytes) => {
-            if true {
-                serde_json::from_slice(&bytes).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
 
@@ -4591,7 +4675,7 @@ async fn rename_user_session(
             .put_object(
                 &state.bucket,
                 &sessions_key,
-                session_bytes.into(),
+                session_bytes,
                 Some("application/json"),
             )
             .await
@@ -4619,13 +4703,7 @@ async fn admin_get_user_sessions(
         .get_object_bytes(&state.bucket, &sessions_key)
         .await
     {
-        Ok(bytes) => {
-            if true {
-                serde_json::from_slice(&bytes).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
 
@@ -4659,13 +4737,7 @@ async fn admin_revoke_user_session(
         .get_object_bytes(&state.bucket, &sessions_key)
         .await
     {
-        Ok(bytes) => {
-            if true {
-                serde_json::from_slice(&bytes).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
 
@@ -4681,7 +4753,7 @@ async fn admin_revoke_user_session(
             .put_object(
                 &state.bucket,
                 &sessions_key,
-                session_bytes.into(),
+                session_bytes,
                 Some("application/json"),
             )
             .await
@@ -4700,8 +4772,7 @@ async fn admin_login(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let admin_token_env = std::env::var("ADMIN_TOKEN")
-        .map_err(|_| (StatusCode::FORBIDDEN, "Admin panel is disabled".to_string()))?;
+    let admin_token_env = admin_bootstrap_secret()?;
 
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -4727,7 +4798,7 @@ async fn admin_login(
     }
 
     let token = &auth_str[7..];
-    if token != admin_token_env {
+    if !secure_equal(token.as_bytes(), admin_token_env.as_bytes()) {
         return Err((StatusCode::FORBIDDEN, "Invalid admin token".to_string()));
     }
 
@@ -4735,16 +4806,7 @@ async fn admin_login(
     let session_id = uuid::Uuid::new_v4().to_string();
     let session_token = generate_token("admin", &state.jwt_secret, expiry, &session_id);
 
-    let ip = headers
-        .get("x-forwarded-for")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("Unknown")
-        .to_string();
-    let user_agent = headers
-        .get(axum::http::header::USER_AGENT)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("Unknown")
-        .to_string();
+    let (user_agent, ip) = request_client_metadata(&headers);
 
     let new_session = UserSession {
         id: session_id,
@@ -4761,17 +4823,15 @@ async fn admin_login(
         .get_object_bytes(&state.bucket, sessions_key)
         .await
     {
-        Ok(bytes) => {
-            if true {
-                serde_json::from_slice(&bytes).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
 
     sessions.push(new_session);
+    if sessions.len() > MAX_SESSIONS_PER_ACCOUNT {
+        sessions.sort_by_key(|session| session.created_at);
+        sessions.drain(..sessions.len() - MAX_SESSIONS_PER_ACCOUNT);
+    }
 
     if let Ok(session_bytes) = serde_json::to_vec(&sessions) {
         state
@@ -4779,7 +4839,7 @@ async fn admin_login(
             .put_object(
                 &state.bucket,
                 sessions_key,
-                session_bytes.into(),
+                session_bytes,
                 Some("application/json"),
             )
             .await
@@ -4806,13 +4866,7 @@ async fn admin_get_sessions(
         .get_object_bytes(&state.bucket, sessions_key)
         .await
     {
-        Ok(bytes) => {
-            if true {
-                serde_json::from_slice(&bytes).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
 
@@ -4821,8 +4875,7 @@ async fn admin_get_sessions(
     let current_session_id =
         if let Some(auth_header) = headers.get(axum::http::header::AUTHORIZATION) {
             if let Ok(auth_str) = auth_header.to_str() {
-                if auth_str.starts_with("Bearer ") {
-                    let token = &auth_str[7..];
+                if let Some(token) = auth_str.strip_prefix("Bearer ") {
                     verify_token_signature(token, &state.jwt_secret)
                         .map(|(_, _, session_id)| session_id)
                 } else {
@@ -4864,13 +4917,7 @@ async fn admin_revoke_session(
         .get_object_bytes(&state.bucket, sessions_key)
         .await
     {
-        Ok(bytes) => {
-            if true {
-                serde_json::from_slice(&bytes).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
 
@@ -4886,7 +4933,7 @@ async fn admin_revoke_session(
             .put_object(
                 &state.bucket,
                 sessions_key,
-                session_bytes.into(),
+                session_bytes,
                 Some("application/json"),
             )
             .await
@@ -4915,13 +4962,7 @@ async fn admin_rename_session(
         .get_object_bytes(&state.bucket, sessions_key)
         .await
     {
-        Ok(bytes) => {
-            if true {
-                serde_json::from_slice(&bytes).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        }
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
 
@@ -4951,7 +4992,7 @@ async fn admin_rename_session(
             .put_object(
                 &state.bucket,
                 sessions_key,
-                session_bytes.into(),
+                session_bytes,
                 Some("application/json"),
             )
             .await
@@ -4984,7 +5025,12 @@ async fn setup_2fa_init(
         6,
         1,
         30,
-        secret.to_bytes().unwrap(),
+        secret.to_bytes().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to encode TOTP secret".to_string(),
+            )
+        })?,
         Some("DillShare".to_string()),
         username,
     )
@@ -5021,6 +5067,9 @@ async fn setup_2fa_confirm(
         )
     })?;
 
+    if payload.secret.len() > 128 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid secret".to_string()));
+    }
     let secret = totp_rs::Secret::Encoded(payload.secret.clone());
     let totp = totp_rs::TOTP::new(
         totp_rs::Algorithm::SHA1,
@@ -5076,7 +5125,7 @@ async fn setup_2fa_confirm(
         .put_object(
             &state.bucket,
             &user_key,
-            user_bytes.into(),
+            user_bytes,
             Some("application/json"),
         )
         .await
@@ -5173,7 +5222,7 @@ async fn disable_2fa(
         .put_object(
             &state.bucket,
             &user_key,
-            user_bytes.into(),
+            user_bytes,
             Some("application/json"),
         )
         .await
@@ -5256,6 +5305,58 @@ mod tests {
         assert!(validate_upload_uuid(&id).is_ok());
         assert!(validate_upload_uuid(&id.to_uppercase()).is_err());
         assert!(validate_upload_uuid("../another-share").is_err());
+    }
+
+    #[test]
+    fn encrypted_payload_hex_is_strict_and_bounded() {
+        assert_eq!(decode_hex("00ff", 2).unwrap(), vec![0, 255]);
+        assert!(decode_hex("0", 2).is_err());
+        assert!(decode_hex("zz", 2).is_err());
+        assert!(decode_hex("000000", 2).is_err());
+    }
+
+    #[test]
+    fn signed_tokens_reject_tampering_and_expiry() {
+        let secret = [7u8; 32];
+        let session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let token = generate_token("alice", &secret, 0, session_id);
+        assert_eq!(
+            verify_token_signature(&token, &secret),
+            Some(("alice".to_string(), 0, session_id.to_string()))
+        );
+        assert!(verify_token_signature(&(token + "0"), &secret).is_none());
+        let expired = generate_token("alice", &secret, 1, session_id);
+        assert!(verify_token_signature(&expired, &secret).is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_storage_enforces_conditional_etags() {
+        let storage = storage::Storage::Memory(std::sync::Arc::new(tokio::sync::Mutex::new(
+            storage::MemoryBackend::default(),
+        )));
+        storage
+            .put_object("test", "object", vec![1], None)
+            .await
+            .unwrap();
+        let original_etag = storage
+            .head_object_info("test", "object")
+            .await
+            .unwrap()
+            .unwrap()
+            .e_tag
+            .unwrap();
+        assert!(storage
+            .put_object_if_match("test", "object", vec![2], None, &original_etag)
+            .await
+            .unwrap());
+        assert!(!storage
+            .put_object_if_match("test", "object", vec![3], None, &original_etag)
+            .await
+            .unwrap());
+        assert_eq!(
+            storage.get_object_bytes("test", "object").await.unwrap(),
+            vec![2]
+        );
     }
 
     #[tokio::test]

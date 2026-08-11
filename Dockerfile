@@ -9,8 +9,8 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /usr/src/dillshare
 
-# Copy Cargo configuration files
-COPY Cargo.toml ./
+# Copy the locked dependency graph for reproducible application builds.
+COPY Cargo.toml Cargo.lock ./
 
 # Create a dummy project to build dependencies first (helps caching layers)
 RUN mkdir src && echo "fn main() {}" > src/main.rs

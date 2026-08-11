@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+use sha2::{Digest, Sha256};
+
 #[derive(Clone)]
 pub enum Storage {
     S3(aws_sdk_s3::Client),
@@ -50,6 +52,15 @@ pub struct CompletedPart {
     pub checksum_sha256: String,
 }
 
+pub struct UploadPartRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub upload_id: &'a str,
+    pub part_number: i32,
+    pub content_length: i64,
+    pub checksum_sha256: &'a str,
+}
+
 #[derive(Debug, Clone)]
 pub struct MultipartUploadInfo {
     pub key: String,
@@ -62,6 +73,10 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn memory_etag(data: &[u8]) -> String {
+    format!("\"{:x}\"", Sha256::digest(data))
 }
 
 impl Storage {
@@ -114,12 +129,7 @@ impl Storage {
 
     pub async fn presign_upload_part(
         &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
-        part_number: i32,
-        content_length: i64,
-        checksum_sha256: &str,
+        request: UploadPartRequest<'_>,
         expires_in: Duration,
     ) -> Result<PresignedRequest, String> {
         let Storage::S3(client) = self else {
@@ -129,12 +139,12 @@ impl Storage {
             .map_err(|e| e.to_string())?;
         let request = client
             .upload_part()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .content_length(content_length)
-            .checksum_sha256(checksum_sha256)
+            .bucket(request.bucket)
+            .key(request.key)
+            .upload_id(request.upload_id)
+            .part_number(request.part_number)
+            .content_length(request.content_length)
+            .checksum_sha256(request.checksum_sha256)
             .presigned(config)
             .await
             .map_err(|e| e.to_string())?;
@@ -226,8 +236,8 @@ impl Storage {
             Storage::Memory(mem) => {
                 let m = mem.lock().await;
                 Ok(m.files.get(key).cloned().map(|bytes| {
-                    let modified = m.last_modified.get(key).copied().unwrap_or_default();
-                    (bytes, format!("memory-{modified}"))
+                    let e_tag = memory_etag(&bytes);
+                    (bytes, e_tag)
                 }))
             }
         }
@@ -259,23 +269,10 @@ impl Storage {
                 m.last_modified.insert(key.to_string(), now_secs());
                 if let Some(ct) = content_type {
                     m.content_types.insert(key.to_string(), ct.to_string());
+                } else {
+                    m.content_types.remove(key);
                 }
                 Ok(())
-            }
-        }
-    }
-
-    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<bool, String> {
-        match self {
-            Storage::S3(client) => {
-                match client.head_object().bucket(bucket).key(key).send().await {
-                    Ok(_) => Ok(true),
-                    Err(_) => Ok(false),
-                }
-            }
-            Storage::Memory(mem) => {
-                let m = mem.lock().await;
-                Ok(m.files.contains_key(key))
             }
         }
     }
@@ -310,7 +307,7 @@ impl Storage {
                 Ok(m.files.get(key).map(|data| HeadObjectInfo {
                     size: data.len() as i64,
                     last_modified_secs: m.last_modified.get(key).copied().unwrap_or_else(now_secs),
-                    e_tag: None,
+                    e_tag: Some(memory_etag(data)),
                 }))
             }
         }
@@ -361,6 +358,8 @@ impl Storage {
                 if let Some(content_type) = content_type {
                     m.content_types
                         .insert(key.to_string(), content_type.to_string());
+                } else {
+                    m.content_types.remove(key);
                 }
                 Ok(true)
             }
@@ -405,7 +404,10 @@ impl Storage {
             }
             Storage::Memory(mem) => {
                 let mut m = mem.lock().await;
-                if !m.files.contains_key(key) {
+                let Some(current) = m.files.get(key) else {
+                    return Ok(false);
+                };
+                if memory_etag(current) != e_tag {
                     return Ok(false);
                 }
                 m.files.insert(key.to_string(), data);
@@ -413,6 +415,8 @@ impl Storage {
                 if let Some(content_type) = content_type {
                     m.content_types
                         .insert(key.to_string(), content_type.to_string());
+                } else {
+                    m.content_types.remove(key);
                 }
                 Ok(true)
             }
@@ -496,6 +500,10 @@ impl Storage {
         prefix: Option<&str>,
         max_keys: Option<i32>,
     ) -> Result<Vec<ObjectInfo>, String> {
+        let limit = max_keys.map(|value| value.max(0) as usize);
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         match self {
             Storage::S3(client) => {
                 let mut req = client.list_objects_v2().bucket(bucket);
@@ -519,37 +527,36 @@ impl Storage {
                                         .map(|d| d.secs())
                                         .unwrap_or(0),
                                 });
+                                if limit.is_some_and(|limit| keys.len() >= limit) {
+                                    return Ok(keys);
+                                }
                             }
                         }
-                    } else {
-                        return Err("S3 list error".to_string());
+                    } else if let Err(error) = res {
+                        return Err(format!("S3 list error: {error}"));
                     }
                 }
                 Ok(keys)
             }
             Storage::Memory(mem) => {
                 let m = mem.lock().await;
-                let mut keys = Vec::new();
-                for (k, v) in &m.files {
-                    if let Some(p) = prefix {
-                        if !k.starts_with(p) {
-                            continue;
-                        }
-                    }
-                    keys.push(ObjectInfo {
-                        key: k.clone(),
-                        size: v.len() as i64,
+                let mut keys: Vec<_> = m
+                    .files
+                    .iter()
+                    .filter(|(key, _)| prefix.is_none_or(|prefix| key.starts_with(prefix)))
+                    .map(|(key, value)| ObjectInfo {
+                        key: key.clone(),
+                        size: value.len() as i64,
                         last_modified_secs: m
                             .last_modified
-                            .get(k)
+                            .get(key)
                             .copied()
                             .unwrap_or_else(now_secs),
-                    });
-                    if let Some(mk) = max_keys {
-                        if keys.len() as i32 >= mk {
-                            break;
-                        }
-                    }
+                    })
+                    .collect();
+                keys.sort_by(|left, right| left.key.cmp(&right.key));
+                if let Some(limit) = limit {
+                    keys.truncate(limit);
                 }
                 Ok(keys)
             }
@@ -570,7 +577,10 @@ impl Storage {
                     req = req.content_type(ct);
                 }
                 let res = req.send().await.map_err(|e| e.to_string())?;
-                Ok(res.upload_id().unwrap_or_default().to_string())
+                res.upload_id()
+                    .filter(|upload_id| !upload_id.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| "S3 returned no multipart upload ID".to_string())
             }
             Storage::Memory(mem) => {
                 let mut m = mem.lock().await;
