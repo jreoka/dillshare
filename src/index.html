@@ -982,6 +982,19 @@
             color: var(--primary);
         }
 
+        .admin-user-identity {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            white-space: nowrap;
+            vertical-align: middle;
+        }
+
+        .admin-user-identity .badge {
+            flex-shrink: 0;
+            line-height: 1;
+        }
+
         /* Custom Scrollbar */
         ::-webkit-scrollbar {
             width: 5px;
@@ -6188,8 +6201,10 @@
                     const row = document.createElement('tr');
                     row.innerHTML = `
                         <td>
-                            <span style="font-family:monospace; font-weight:600; color:var(--primary);">${escapeHtml(u.username)}</span>
-                            <span class="badge ${u.role === 'superadmin' ? 'success' : ''}" style="display:inline-block; margin-left:0.4rem; font-size:0.65rem; text-transform:uppercase;">${escapeHtml(u.role)}</span>
+                            <span class="admin-user-identity">
+                                <span style="font-family:monospace; font-weight:600; color:var(--primary);">${escapeHtml(u.username)}</span>
+                                <span class="badge ${u.role === 'superadmin' ? 'success' : ''}" style="font-size:0.65rem; text-transform:uppercase;">${escapeHtml(u.role)}</span>
+                            </span>
                         </td>
                         <td>${u.shares.length} shares</td>
                         <td>${formatBytes(u.total_size)}</td>
