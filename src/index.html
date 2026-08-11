@@ -1173,6 +1173,7 @@
                 <button class="nav-btn" id="nav-shares">Active Shares</button>
                 <button class="nav-btn" id="nav-sessions">Sessions</button>
                 <button class="nav-btn" id="nav-profile">Profile</button>
+                <button class="nav-btn" id="nav-admin" style="display: none;">Admin</button>
                 <span class="nav-separator" style="color: var(--surface-border); font-size: 0.8rem; margin: 0 0.25rem;">|</span>
             </div>
             <button class="nav-btn" id="nav-auth-btn" style="color: var(--primary); border: 1px solid rgba(76, 175, 80, 0.2); font-weight: 600;">Sign In</button>
@@ -1324,20 +1325,13 @@
                         <h2 style="font-size: 1.5rem; margin-bottom: 0.25rem;">Admin Panel</h2>
                         <p class="file-meta">Manage users and space allocation</p>
                     </div>
-                    <div style="display: flex; gap: 0.5rem;">
-                        <button class="btn btn-secondary" id="btn-refresh-admin" style="display: none;">Refresh Stats</button>
-                        <button class="btn btn-danger" id="btn-logout-admin" style="display: none;">Admin Logout</button>
-                    </div>
+                    <button class="btn btn-secondary" id="btn-refresh-admin" style="display: none;">Refresh Stats</button>
                 </div>
 
                 <div id="admin-token-required" class="empty-state" style="display: none; max-width: 400px; margin: 2rem auto;">
                     <svg viewBox="0 0 24 24" style="width:2.5rem; height:2.5rem; fill:currentColor; margin-bottom:0.75rem; opacity:0.3;"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
-                    <h3>Admin Token Required</h3>
-                    <p style="color: var(--text-muted); font-size:0.85rem; margin-top:0.25rem; margin-bottom:1rem;">Please enter the administrator access token to view the dashboard.</p>
-                    <form id="admin-token-form" style="display: flex; flex-direction: column; gap: 0.75rem; width: 100%;">
-                        <input type="password" id="admin-token-input" placeholder="Admin Token" required style="background: rgba(0,0,0,0.2); border: 1px solid var(--surface-border); border-radius: 4px; padding: 0.5rem 0.75rem; color: var(--text-main); font-family: inherit; font-size: 0.85rem; outline: none; text-align: center; width: 100%;">
-                        <button class="btn" type="submit" style="justify-content: center; padding: 0.5rem; font-weight: 600; font-size: 0.85rem; width: 100%;">Access Dashboard</button>
-                    </form>
+                    <h3>Administrator Access Required</h3>
+                    <p style="color: var(--text-muted); font-size:0.85rem; margin-top:0.25rem;">Sign in with an administrator account to view this dashboard.</p>
                 </div>
 
                 <div id="admin-loading" class="empty-state" style="display: none; max-width: 400px; margin: 2rem auto;">
@@ -1348,7 +1342,6 @@
                 <div id="admin-dashboard" style="display: none;">
                     <div class="admin-tabs" id="admin-tabs-nav" style="display: flex; gap: 1rem; margin-top: 1rem; margin-bottom: 1.5rem; border-bottom: 1px solid var(--surface-border); padding-bottom: 0.5rem;">
                         <button class="admin-tab-btn active" id="admin-tab-users" style="background: none; border: none; color: var(--primary); font-weight: 600; cursor: pointer; padding: 0.5rem; border-bottom: 2px solid var(--primary); font-family: inherit; font-size: 0.9rem; transition: all 0.2s; outline: none;">Users & Storage</button>
-                        <button class="admin-tab-btn" id="admin-tab-sessions" style="background: none; border: none; color: var(--text-muted); font-weight: 500; cursor: pointer; padding: 0.5rem; font-family: inherit; font-size: 0.9rem; transition: all 0.2s; outline: none;">Admin Sessions</button>
                     </div>
 
                     <!-- Users & Storage View -->
@@ -1371,27 +1364,6 @@
                         </div>
                     </div>
 
-                    <!-- Admin Sessions View -->
-                    <div id="admin-sessions-view" style="display: none;">
-                        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem; margin-top: 0.5rem;">
-                            These are the active administrator sessions. You can revoke any session to log it out immediately.
-                        </p>
-                        <div class="shares-table-wrapper">
-                            <table style="width: 100%; border-collapse: collapse; text-align: left;" id="admin-sessions-table">
-                                <thead>
-                                    <tr>
-                                        <th>Device / User Agent</th>
-                                        <th>IP Address</th>
-                                        <th>Created</th>
-                                        <th>Action</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="admin-sessions-list-body">
-                                    <!-- Dynamic admin sessions list -->
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
                 </div>
             </div>
         </div>
@@ -1706,6 +1678,9 @@
     <div class="toast-container" id="toast-container"></div>
 
     <script>
+        const SHARE_EXPIRY_DAYS = __DILLSHARE_SHARE_EXPIRY_DAYS__;
+        const MAX_SHARE_BYTES = __DILLSHARE_MAX_SHARE_BYTES__;
+
         function bufferToBase64url(buffer) {
             const bytes = new Uint8Array(buffer);
             let str = '';
@@ -1743,6 +1718,7 @@
         const navShares = document.getElementById('nav-shares');
         const navSessions = document.getElementById('nav-sessions');
         const navProfile = document.getElementById('nav-profile');
+        const navAdmin = document.getElementById('nav-admin');
         const logoLink = document.getElementById('logo-link');
 
         const uploadBoxTitle = document.getElementById('upload-box-title');
@@ -2817,6 +2793,7 @@
                 loadUserPasskeysView();
             }
             if (viewId === 'view-admin') {
+                if (navAdmin) navAdmin.classList.add('active');
                 loadAdminStats();
             }
         }
@@ -2842,6 +2819,13 @@
             window.history.pushState({}, '', '/profile');
             showTab('view-profile');
         });
+
+        if (navAdmin) {
+            navAdmin.addEventListener('click', () => {
+                window.history.pushState({}, '', '/admin');
+                showTab('view-admin');
+            });
+        }
 
         logoLink.addEventListener('click', (e) => {
             e.preventDefault();
@@ -2885,7 +2869,13 @@
                     showTab('view-upload');
                 }
             } else if (path === '/admin') {
-                showTab('view-admin');
+                const role = localStorage.getItem('dill_role');
+                if (role === 'admin' || role === 'superadmin') {
+                    showTab('view-admin');
+                } else {
+                    window.history.replaceState({}, '', '/');
+                    showTab('view-upload');
+                }
             } else {
                 showTab('view-upload');
             }
@@ -5290,6 +5280,12 @@
             }
         }
 
+        function setAdminRoleUi(role) {
+            const isAdmin = role === 'admin' || role === 'superadmin';
+            if (navAdmin) navAdmin.style.display = isAdmin ? '' : 'none';
+            if (role) localStorage.setItem('dill_role', role);
+        }
+
         function updateHeaderAuthState() {
             const token = localStorage.getItem('dill_session_token');
             const username = localStorage.getItem('dill_username');
@@ -5305,8 +5301,8 @@
                 profileBadge.style.display = 'flex';
                 headerUsername.textContent = username;
                 if (navLinks) navLinks.style.display = 'flex';
+                setAdminRoleUi(localStorage.getItem('dill_role') || 'user');
 
-                // Display profile picture
                 const storedPfp = localStorage.getItem('dill_pfp');
                 if (storedPfp) {
                     headerPfpImg.src = storedPfp;
@@ -5316,29 +5312,32 @@
                     headerPfpImg.style.display = 'none';
                     headerPfpPl.style.display = 'flex';
                     headerPfpPl.textContent = username.substring(0, 1).toUpperCase();
-
-                    // Fetch profile to check if there is a pfp in S3
-                    fetch('/api/user/profile', {
-                        headers: { 'Authorization': `Bearer ${token}` }
-                    }).then(res => {
-                        if (res.ok) return res.json();
-                    }).then(async profile => {
-                        const pfpEncHex = profile ? (profile.pfp_enc || profile.pfp) : null;
-                        if (pfpEncHex) {
-                            const decryptedPfp = await decryptPfp(pfpEncHex);
-                            if (decryptedPfp) {
-                                localStorage.setItem('dill_pfp', decryptedPfp);
-                                headerPfpImg.src = decryptedPfp;
-                                headerPfpImg.style.display = 'block';
-                                headerPfpPl.style.display = 'none';
-                            }
-                        }
-                    }).catch(() => {});
                 }
+
+                // Refresh the server-authoritative role on every page load so
+                // promotions and demotions take effect without another login.
+                fetch('/api/user/profile', {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                }).then(res => res.ok ? res.json() : null).then(async profile => {
+                    if (!profile) return;
+                    setAdminRoleUi(profile.role || 'user');
+                    const pfpEncHex = profile.pfp_enc || profile.pfp;
+                    if (!storedPfp && pfpEncHex) {
+                        const decryptedPfp = await decryptPfp(pfpEncHex);
+                        if (decryptedPfp) {
+                            localStorage.setItem('dill_pfp', decryptedPfp);
+                            headerPfpImg.src = decryptedPfp;
+                            headerPfpImg.style.display = 'block';
+                            headerPfpPl.style.display = 'none';
+                        }
+                    }
+                }).catch(() => {});
             } else {
                 authBtn.style.display = 'block';
                 profileBadge.style.display = 'none';
                 if (navLinks) navLinks.style.display = 'none';
+                if (navAdmin) navAdmin.style.display = 'none';
+                localStorage.removeItem('dill_role');
             }
             updateUploadBoxState();
         }
@@ -5543,6 +5542,7 @@
                     if (encKeyHex) {
                         localStorage.setItem('dill_session_token', finalData.token);
                         localStorage.setItem('dill_username', loggedInUsername);
+                        localStorage.setItem('dill_role', finalData.role || 'user');
                         localStorage.setItem('dill_enc_key', encKeyHex);
                         const pfpEncHex = finalData.pfp_enc || finalData.pfp;
                         if (pfpEncHex) {
@@ -5647,6 +5647,7 @@
             const data = await res.json();
             localStorage.setItem('dill_session_token', data.token);
             localStorage.setItem('dill_username', username);
+            localStorage.setItem('dill_role', data.role || 'user');
             localStorage.setItem('dill_enc_key', bufToHex(encKeyBuf));
             localStorage.setItem('dill_enc_key_' + username, bufToHex(encKeyBuf));
             const pfpEncHex = data.pfp_enc || data.pfp;
@@ -5693,6 +5694,7 @@
             }
             localStorage.removeItem('dill_session_token');
             localStorage.removeItem('dill_username');
+            localStorage.removeItem('dill_role');
             localStorage.removeItem('dill_enc_key');
             localStorage.removeItem('dill_pfp');
             showToast('Logged out successfully.', 'info');
@@ -5943,6 +5945,7 @@
                 if (res.ok) return res.json();
             }).then(profile => {
                 if (profile) {
+                    setAdminRoleUi(profile.role || 'user');
                     const statusText = document.getElementById('settings-2fa-status-text');
                     const toggleBtn = document.getElementById('btn-toggle-2fa');
                     
@@ -6100,7 +6103,8 @@
                 uploadBtnGroup.style.display = 'flex';
                 authPrompt.style.display = 'none';
                 uploadTitle.textContent = 'Drag & Drop Files or Folders';
-                uploadDesc.textContent = 'Files are uploaded securely and self-delete after 90 days.';
+                const expiryUnit = SHARE_EXPIRY_DAYS === 1 ? 'day' : 'days';
+                uploadDesc.textContent = `Files are uploaded securely and self-delete after ${SHARE_EXPIRY_DAYS} ${expiryUnit}. Maximum share size: ${formatBytes(MAX_SHARE_BYTES)}.`;
                 uploadDesc.style.color = '';
                 uploadDesc.style.fontWeight = '';
                 dropZoneCard.style.cursor = 'pointer';
@@ -6121,161 +6125,19 @@
 
         // --- ADMIN PANEL CONTROLLER ---
 
-        btnRefreshAdmin.addEventListener('click', () => {
-            const usersTab = document.getElementById('admin-tab-users');
-            if (usersTab && usersTab.classList.contains('active')) {
-                loadAdminStats();
-            } else {
-                loadAdminSessions();
-            }
-        });
-        
-        const btnLogoutAdmin = document.getElementById('btn-logout-admin');
-        const tabUsers = document.getElementById('admin-tab-users');
-        const tabSessions = document.getElementById('admin-tab-sessions');
-        const viewUsers = document.getElementById('admin-users-view');
-        const viewAdminSessions = document.getElementById('admin-sessions-view');
-
-        if (btnLogoutAdmin) {
-            btnLogoutAdmin.addEventListener('click', async () => {
-                const token = localStorage.getItem('dill_admin_token');
-                // Revoke the current admin session on the server before clearing local state
-                if (token) {
-                    try {
-                        const res = await fetch('/api/admin/sessions', {
-                            headers: { 'Authorization': `Bearer ${token}` }
-                        });
-                        if (res.ok) {
-                            const sessions = await res.json();
-                            const current = sessions.find(s => s.is_current);
-                            if (current) {
-                                await fetch(`/api/admin/sessions/${current.id}`, {
-                                    method: 'DELETE',
-                                    headers: { 'Authorization': `Bearer ${token}` }
-                                });
-                            }
-                        }
-                    } catch (e) { /* ignore network errors during logout */ }
-                }
-                localStorage.removeItem('dill_admin_token');
-                const adminTokenInput = document.getElementById('admin-token-input');
-                if (adminTokenInput) adminTokenInput.value = '';
-                if (window.location.search.includes('token=')) {
-                    window.history.replaceState({}, '', '/admin');
-                }
-                // Reset active tab to users
-                if (tabUsers && tabSessions && viewUsers && viewAdminSessions) {
-                    tabUsers.classList.add('active');
-                    tabUsers.style.color = 'var(--primary)';
-                    tabUsers.style.borderBottom = '2px solid var(--primary)';
-                    tabUsers.style.fontWeight = '600';
-
-                    tabSessions.classList.remove('active');
-                    tabSessions.style.color = 'var(--text-muted)';
-                    tabSessions.style.borderBottom = 'none';
-                    tabSessions.style.fontWeight = '500';
-
-                    viewUsers.style.display = 'block';
-                    viewAdminSessions.style.display = 'none';
-                }
-                showToast('Logged out of Admin Panel', 'success');
-                loadAdminStats();
-            });
-        }
-
-        // Tab switching logic for Admin Panel
-        if (tabUsers && tabSessions && viewUsers && viewAdminSessions) {
-            tabUsers.addEventListener('click', () => {
-                tabUsers.classList.add('active');
-                tabUsers.style.color = 'var(--primary)';
-                tabUsers.style.borderBottom = '2px solid var(--primary)';
-                tabUsers.style.fontWeight = '600';
-
-                tabSessions.classList.remove('active');
-                tabSessions.style.color = 'var(--text-muted)';
-                tabSessions.style.borderBottom = 'none';
-                tabSessions.style.fontWeight = '500';
-
-                viewUsers.style.display = 'block';
-                viewAdminSessions.style.display = 'none';
-                loadAdminStats();
-            });
-
-            tabSessions.addEventListener('click', () => {
-                tabSessions.classList.add('active');
-                tabSessions.style.color = 'var(--primary)';
-                tabSessions.style.borderBottom = '2px solid var(--primary)';
-                tabSessions.style.fontWeight = '600';
-
-                tabUsers.classList.remove('active');
-                tabUsers.style.color = 'var(--text-muted)';
-                tabUsers.style.borderBottom = 'none';
-                tabUsers.style.fontWeight = '500';
-
-                viewUsers.style.display = 'none';
-                viewAdminSessions.style.display = 'block';
-                loadAdminSessions();
-            });
-        }
-        
-        const adminTokenForm = document.getElementById('admin-token-form');
-        if (adminTokenForm) {
-            adminTokenForm.addEventListener('submit', async (e) => {
-                e.preventDefault();
-                const tokenInput = document.getElementById('admin-token-input').value.trim();
-                if (tokenInput) {
-                    try {
-                        const res = await fetch('/api/admin/login', {
-                            method: 'POST',
-                            headers: { 'Authorization': `Bearer ${tokenInput}` }
-                        });
-                        if (!res.ok) throw new Error(await res.text() || 'Invalid admin token');
-                        const data = await res.json();
-                        localStorage.setItem('dill_admin_token', data.token);
-                        document.getElementById('admin-token-input').value = '';
-                        showToast('Admin logged in successfully', 'success');
-                        loadAdminStats();
-                    } catch (err) {
-                        localStorage.removeItem('dill_admin_token');
-                        showToast(err.message || 'Admin login failed', 'error');
-                    }
-                }
-            });
-        }
+        btnRefreshAdmin.addEventListener('click', loadAdminStats);
 
         async function loadAdminStats() {
-            const params = new URLSearchParams(window.location.search);
-            const bootstrapToken = params.get('token');
-            let token = localStorage.getItem('dill_admin_token');
-            if (bootstrapToken) {
-                // Exchange legacy query-string bootstrap tokens immediately so
-                // the administrator secret does not remain in browser history.
-                window.history.replaceState({}, '', '/admin');
-                try {
-                    const login = await fetch('/api/admin/login', {
-                        method: 'POST',
-                        headers: { 'Authorization': `Bearer ${bootstrapToken}` }
-                    });
-                    if (!login.ok) throw new Error(await login.text());
-                    token = (await login.json()).token;
-                    localStorage.setItem('dill_admin_token', token);
-                } catch (error) {
-                    token = null;
-                    localStorage.removeItem('dill_admin_token');
-                    showToast(error.message || 'Invalid admin token', 'error');
-                }
-            }
+            const token = localStorage.getItem('dill_session_token');
             const dashboard = document.getElementById('admin-dashboard');
             const tokenReq = document.getElementById('admin-token-required');
             const usersBody = document.getElementById('admin-users-list-body');
-            const btnLogoutAdmin = document.getElementById('btn-logout-admin');
             const adminLoading = document.getElementById('admin-loading');
 
             if (!token) {
                 dashboard.style.display = 'none';
                 tokenReq.style.display = 'block';
                 if (adminLoading) adminLoading.style.display = 'none';
-                if (btnLogoutAdmin) btnLogoutAdmin.style.display = 'none';
                 if (btnRefreshAdmin) btnRefreshAdmin.style.display = 'none';
                 return;
             }
@@ -6284,7 +6146,6 @@
             dashboard.style.display = 'none';
             tokenReq.style.display = 'none';
             if (adminLoading) adminLoading.style.display = 'block';
-            if (btnLogoutAdmin) btnLogoutAdmin.style.display = 'none';
             if (btnRefreshAdmin) btnRefreshAdmin.style.display = 'none';
             usersBody.innerHTML = '';
 
@@ -6295,30 +6156,25 @@
 
                 if (!res.ok) {
                     if (res.status === 403 || res.status === 401) {
-                        localStorage.removeItem('dill_admin_token');
-                        const adminTokenInput = document.getElementById('admin-token-input');
-                        if (adminTokenInput) adminTokenInput.value = '';
-                        if (window.location.search.includes('token=')) {
-                            window.history.replaceState({}, '', '/admin');
-                        }
                         dashboard.style.display = 'none';
                         if (adminLoading) adminLoading.style.display = 'none';
                         tokenReq.style.display = 'block';
-                        if (btnLogoutAdmin) btnLogoutAdmin.style.display = 'none';
                         if (btnRefreshAdmin) btnRefreshAdmin.style.display = 'none';
-                        showToast('Admin panel is disabled or invalid token', 'error');
+                        setAdminRoleUi('user');
                         return;
                     }
                     throw new Error(await res.text());
                 }
 
-                const stats = await res.json();
+                const result = await res.json();
+                const stats = Array.isArray(result.users) ? result.users : [];
+                const canManageRoles = result.current_role === 'superadmin';
+                setAdminRoleUi(result.current_role);
                 
                 // Hide loading and show dashboard now that validation succeeded
                 if (adminLoading) adminLoading.style.display = 'none';
                 dashboard.style.display = 'block';
                 tokenReq.style.display = 'none';
-                if (btnLogoutAdmin) btnLogoutAdmin.style.display = 'inline-flex';
                 if (btnRefreshAdmin) btnRefreshAdmin.style.display = 'inline-flex';
 
                 usersBody.innerHTML = '';
@@ -6333,6 +6189,7 @@
                     row.innerHTML = `
                         <td>
                             <span style="font-family:monospace; font-weight:600; color:var(--primary);">${escapeHtml(u.username)}</span>
+                            <span class="badge ${u.role === 'superadmin' ? 'success' : ''}" style="display:inline-block; margin-left:0.4rem; font-size:0.65rem; text-transform:uppercase;">${escapeHtml(u.role)}</span>
                         </td>
                         <td>${u.shares.length} shares</td>
                         <td>${formatBytes(u.total_size)}</td>
@@ -6345,9 +6202,16 @@
                                 <button class="action-btn toggle-sessions-btn" data-username="${u.username}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600; color:var(--primary);">
                                     View Sessions
                                 </button>
-                                <button class="action-btn delete delete-user-btn" data-username="${u.username}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600;">
-                                    Delete User
-                                </button>
+                                ${canManageRoles && u.role !== 'superadmin' ? `
+                                    <button class="action-btn change-role-btn" data-username="${u.username}" data-role="${u.role}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600; color:var(--primary);">
+                                        ${u.role === 'admin' ? 'Demote' : 'Promote to Admin'}
+                                    </button>
+                                ` : ''}
+                                ${u.role !== 'superadmin' && (u.role !== 'admin' || canManageRoles) ? `
+                                    <button class="action-btn delete delete-user-btn" data-username="${u.username}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600;">
+                                        Delete User
+                                    </button>
+                                ` : ''}
                             </div>
                         </td>
                     `;
@@ -6588,6 +6452,35 @@
                     });
                 });
 
+                // Promote or demote administrators (superadmin only)
+                document.querySelectorAll('.change-role-btn').forEach(btn => {
+                    btn.addEventListener('click', async (e) => {
+                        const targetBtn = e.currentTarget;
+                        const username = targetBtn.getAttribute('data-username');
+                        const currentRole = targetBtn.getAttribute('data-role');
+                        const newRole = currentRole === 'admin' ? 'user' : 'admin';
+                        const verb = newRole === 'admin' ? 'promote' : 'demote';
+                        if (!await customConfirm(`Are you sure you want to ${verb} "${username}"?`, `${verb[0].toUpperCase() + verb.slice(1)} User`, verb[0].toUpperCase() + verb.slice(1), false)) return;
+                        targetBtn.disabled = true;
+                        try {
+                            const res = await fetch(`/api/admin/user/${username}/role`, {
+                                method: 'PUT',
+                                headers: {
+                                    'Authorization': `Bearer ${token}`,
+                                    'Content-Type': 'application/json'
+                                },
+                                body: JSON.stringify({ role: newRole })
+                            });
+                            if (!res.ok) throw new Error(await res.text());
+                            showToast(`${username} is now ${newRole === 'admin' ? 'an administrator' : 'a regular user'}.`, 'success');
+                            loadAdminStats();
+                        } catch (error) {
+                            showToast(error.message || `Failed to ${verb} user`, 'error');
+                            targetBtn.disabled = false;
+                        }
+                    });
+                });
+
                 // Delete specific user (Admin)
                 document.querySelectorAll('.delete-user-btn').forEach(btn => {
                     btn.addEventListener('click', async (e) => {
@@ -6632,7 +6525,7 @@
         }
 
         async function loadAdminSessions() {
-            const token = localStorage.getItem('dill_admin_token');
+            const token = localStorage.getItem('dill_session_token');
             const adminSessionsBody = document.getElementById('admin-sessions-list-body');
             if (!token) return;
 
@@ -6768,11 +6661,7 @@
                                     if (revRes.ok) {
                                         showToast(isCurrent ? 'Logged out successfully' : 'Admin session revoked successfully', 'success');
                                         if (isCurrent) {
-                                            localStorage.removeItem('dill_admin_token');
-                                            const adminTokenInput = document.getElementById('admin-token-input');
-                                            if (adminTokenInput) adminTokenInput.value = '';
-                                            window.history.replaceState({}, '', '/admin');
-                                            loadAdminStats();
+                                            await logoutUser();
                                         } else {
                                             loadAdminSessions();
                                         }

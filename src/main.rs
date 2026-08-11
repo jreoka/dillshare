@@ -145,6 +145,10 @@ async fn main() {
         }
     }
 
+    initialize_admin_roles(&storage, &bucket)
+        .await
+        .unwrap_or_else(|error| panic!("Failed to initialize account roles: {error}"));
+
     // Get JWT secret from environment or load/generate in S3
     let jwt_secret = match std::env::var("JWT_SECRET") {
         Ok(secret_str) if secret_str.len() >= 32 => secret_str.into_bytes(),
@@ -275,16 +279,11 @@ async fn main() {
             get(setup_2fa_init).post(setup_2fa_confirm),
         )
         .route("/api/user/2fa", delete(disable_2fa))
-        // Admin routes
-        .route("/api/admin/login", post(admin_login))
-        .route("/api/admin/sessions", get(admin_get_sessions))
-        .route(
-            "/api/admin/sessions/:id",
-            delete(admin_revoke_session).put(admin_rename_session),
-        )
+        // Admin routes (authorized by the signed-in account role)
         .route("/api/admin/stats", get(admin_get_stats))
         .route("/api/admin/share/:uuid", delete(admin_delete_share))
         .route("/api/admin/user/:username", delete(admin_delete_user))
+        .route("/api/admin/user/:username/role", put(admin_set_user_role))
         .route(
             "/api/admin/user/:username/sessions",
             get(admin_get_user_sessions),
@@ -795,11 +794,15 @@ async fn passkey_auth_finish(
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     let pfp_enc = fetch_user_pfp_enc(&state, &username).await;
+    let role = account_role(&state, &username)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     Ok(Json(serde_json::json!({
         "success": true,
         "token": token,
         "username": username,
+        "role": role.as_str(),
         "pfp_enc": pfp_enc,
         "pfp": pfp_enc
     })))
@@ -1004,7 +1007,17 @@ async fn api_not_found() -> impl IntoResponse {
 }
 
 // Serve the embedded SPA without caching HTML across binary upgrades.
-async fn serve_index() -> impl IntoResponse {
+async fn serve_index(State(state): State<AppState>) -> impl IntoResponse {
+    let share_expiry_days = state.share_expiry_secs / (24 * 60 * 60);
+    let html = include_str!("index.html")
+        .replace(
+            "__DILLSHARE_SHARE_EXPIRY_DAYS__",
+            &share_expiry_days.to_string(),
+        )
+        .replace(
+            "__DILLSHARE_MAX_SHARE_BYTES__",
+            &state.max_share_bytes.to_string(),
+        );
     (
         [
             (axum::http::header::CACHE_CONTROL, "no-cache"),
@@ -1012,7 +1025,7 @@ async fn serve_index() -> impl IntoResponse {
             (axum::http::header::REFERRER_POLICY, "no-referrer"),
             (axum::http::header::X_FRAME_OPTIONS, "DENY"),
         ],
-        Html(include_str!("index.html")),
+        Html(html),
     )
 }
 
@@ -3040,7 +3053,7 @@ async fn remove_share_from_user_index(
     }
 }
 
-// Background cleanup worker thread - deletes S3 objects older than 90 days or abandoned partial uploads older than 1 hour
+// Background cleanup worker - deletes objects using the configured share and partial-upload lifetimes.
 async fn run_cleanup_worker(storage: storage::Storage, bucket: String) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // check every hour
     loop {
@@ -3402,6 +3415,261 @@ async fn perform_cleanup(
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+const ADMIN_ROLES_KEY: &str = "config/admin_roles.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AdminRoles {
+    version: u8,
+    superadmin: String,
+    #[serde(default)]
+    admins: std::collections::BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountRole {
+    User,
+    Admin,
+    Superadmin,
+}
+
+impl AccountRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Admin => "admin",
+            Self::Superadmin => "superadmin",
+        }
+    }
+}
+
+impl AdminRoles {
+    fn role_for(&self, username: &str) -> AccountRole {
+        if self.superadmin == username {
+            AccountRole::Superadmin
+        } else if self.admins.contains(username) {
+            AccountRole::Admin
+        } else {
+            AccountRole::User
+        }
+    }
+}
+
+fn parse_admin_roles(bytes: &[u8]) -> Result<AdminRoles, String> {
+    let mut roles: AdminRoles = serde_json::from_slice(bytes)
+        .map_err(|error| format!("Invalid administrator role data: {error}"))?;
+    if roles.version != 1 || !is_valid_username(&roles.superadmin) {
+        return Err("Invalid administrator role data".to_string());
+    }
+    roles
+        .admins
+        .retain(|username| is_valid_username(username) && username != &roles.superadmin);
+    Ok(roles)
+}
+
+async fn load_admin_roles_from_storage(
+    storage: &storage::Storage,
+    bucket: &str,
+) -> Result<Option<AdminRoles>, String> {
+    match storage.get_object_bytes(bucket, ADMIN_ROLES_KEY).await {
+        Ok(bytes) => parse_admin_roles(&bytes).map(Some),
+        Err(error) => {
+            if storage
+                .head_object_info(bucket, ADMIN_ROLES_KEY)
+                .await?
+                .is_none()
+            {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+async fn initialize_admin_roles(storage: &storage::Storage, bucket: &str) -> Result<(), String> {
+    if load_admin_roles_from_storage(storage, bucket)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    // Existing installations predate role metadata. Select the oldest top-level
+    // account object as the deterministic migration equivalent of the first signup.
+    let mut users: Vec<(i64, String)> = storage
+        .list_objects(bucket, Some("users/"), None)
+        .await?
+        .into_iter()
+        .filter_map(|object| {
+            let relative = object.key.strip_prefix("users/")?;
+            if relative.contains('/') {
+                return None;
+            }
+            let username = relative.strip_suffix(".json")?;
+            is_valid_username(username).then(|| (object.last_modified_secs, username.to_string()))
+        })
+        .collect();
+    users.sort_by(|left, right| left.cmp(right));
+    let Some((_, username)) = users.into_iter().next() else {
+        return Ok(());
+    };
+
+    let roles = AdminRoles {
+        version: 1,
+        superadmin: username.clone(),
+        admins: std::collections::BTreeSet::new(),
+    };
+    let created = storage
+        .put_object_if_absent(
+            bucket,
+            ADMIN_ROLES_KEY,
+            serde_json::to_vec(&roles).map_err(|error| error.to_string())?,
+            Some("application/json"),
+        )
+        .await?;
+    if created {
+        tracing::warn!(
+            superadmin = username,
+            "Migrated existing installation: oldest account is now superadmin"
+        );
+    }
+    Ok(())
+}
+
+async fn claim_superadmin_if_first(
+    state: &AppState,
+    username: &str,
+) -> Result<AccountRole, String> {
+    let roles = AdminRoles {
+        version: 1,
+        superadmin: username.to_string(),
+        admins: std::collections::BTreeSet::new(),
+    };
+    let created = match state
+        .storage
+        .put_object_if_absent(
+            &state.bucket,
+            ADMIN_ROLES_KEY,
+            serde_json::to_vec(&roles).map_err(|error| error.to_string())?,
+            Some("application/json"),
+        )
+        .await
+    {
+        Ok(created) => created,
+        Err(write_error) => {
+            // A timed-out conditional write may still have reached object storage.
+            // Read back before reporting an error so we never delete the account
+            // that successfully became superadmin.
+            if let Some(current) =
+                load_admin_roles_from_storage(&state.storage, &state.bucket).await?
+            {
+                return Ok(current.role_for(username));
+            }
+            return Err(write_error);
+        }
+    };
+    if created {
+        tracing::info!(
+            superadmin = username,
+            "First account claimed superadmin role"
+        );
+        Ok(AccountRole::Superadmin)
+    } else {
+        let roles = load_admin_roles_from_storage(&state.storage, &state.bucket)
+            .await?
+            .ok_or_else(|| "Administrator role data disappeared".to_string())?;
+        Ok(roles.role_for(username))
+    }
+}
+
+async fn account_role(state: &AppState, username: &str) -> Result<AccountRole, String> {
+    Ok(load_admin_roles_from_storage(&state.storage, &state.bucket)
+        .await?
+        .map(|roles| roles.role_for(username))
+        .unwrap_or(AccountRole::User))
+}
+
+async fn update_promoted_admin(
+    state: &AppState,
+    username: &str,
+    promote: bool,
+) -> Result<(), (StatusCode, String)> {
+    for _ in 0..5 {
+        let Some((bytes, e_tag)) = state
+            .storage
+            .get_object_bytes_with_etag(&state.bucket, ADMIN_ROLES_KEY)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
+        else {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Administrator roles are not initialized".to_string(),
+            ));
+        };
+        let mut roles = parse_admin_roles(&bytes)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        if roles.superadmin == username {
+            return Err((
+                StatusCode::CONFLICT,
+                "The superadmin role cannot be changed".to_string(),
+            ));
+        }
+        if promote {
+            roles.admins.insert(username.to_string());
+        } else {
+            roles.admins.remove(username);
+        }
+        let updated = state
+            .storage
+            .put_object_if_match(
+                &state.bucket,
+                ADMIN_ROLES_KEY,
+                serde_json::to_vec(&roles)
+                    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+                Some("application/json"),
+                &e_tag,
+            )
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        if updated {
+            return Ok(());
+        }
+    }
+    Err((
+        StatusCode::CONFLICT,
+        "Administrator roles changed concurrently; retry".to_string(),
+    ))
+}
+
+#[derive(Debug)]
+struct AdminIdentity {
+    username: String,
+    role: AccountRole,
+}
+
+async fn verify_admin(
+    headers: &axum::http::HeaderMap,
+    state: &AppState,
+) -> Result<AdminIdentity, (StatusCode, String)> {
+    let token = extract_token(headers)?;
+    let (username, _) = verify_session(&token, state).await.ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Invalid or expired session".to_string(),
+        )
+    })?;
+    let role = account_role(state, &username)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    if role == AccountRole::User {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Administrator access required".to_string(),
+        ));
+    }
+    Ok(AdminIdentity { username, role })
+}
+
 #[derive(serde::Deserialize)]
 struct AuthRequest {
     username: String,
@@ -3492,7 +3760,8 @@ async fn register_user(
     let password_hash = format!("{:02x}", hasher.finalize());
 
     let user_data = serde_json::json!({
-        "password_hash": password_hash
+        "password_hash": password_hash,
+        "created_at": chrono::Utc::now().timestamp()
     });
     let user_bytes = serde_json::to_vec(&user_data)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -3518,6 +3787,13 @@ async fn register_user(
         return Err((
             StatusCode::CONFLICT,
             "Username is already taken".to_string(),
+        ));
+    }
+
+    if let Err(error) = claim_superadmin_if_first(&state, username).await {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Account was created, but its role could not be assigned: {error}"),
         ));
     }
 
@@ -3638,9 +3914,13 @@ async fn login_user(
     }
 
     let pfp_enc = fetch_user_pfp_enc(&state, username).await;
+    let role = account_role(&state, username)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     Ok(axum::Json(serde_json::json!({
         "token": token,
+        "role": role.as_str(),
         "pfp_enc": pfp_enc,
         "pfp": pfp_enc
     })))
@@ -3863,7 +4143,16 @@ async fn admin_get_stats(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    verify_admin(&headers, &state).await?;
+    let identity = verify_admin(&headers, &state).await?;
+    let roles = load_admin_roles_from_storage(&state.storage, &state.bucket)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Administrator roles are not initialized".to_string(),
+            )
+        })?;
 
     let objects = state
         .storage
@@ -3927,14 +4216,24 @@ async fn admin_get_stats(
             .sum();
 
         stats.push(serde_json::json!({
+            "role": roles.role_for(&username).as_str(),
             "username": username,
             "total_size": total_size,
             "shares": shares,
             "has_2fa": totp_enabled
         }));
     }
+    stats.sort_by(|left, right| {
+        left.get("username")
+            .and_then(|value| value.as_str())
+            .cmp(&right.get("username").and_then(|value| value.as_str()))
+    });
 
-    Ok(axum::Json(stats))
+    Ok(axum::Json(serde_json::json!({
+        "current_user": identity.username,
+        "current_role": identity.role.as_str(),
+        "users": stats
+    })))
 }
 
 async fn admin_delete_share(
@@ -3992,16 +4291,79 @@ async fn admin_delete_share(
     Ok(StatusCode::OK)
 }
 
+#[derive(serde::Deserialize)]
+struct AdminRoleUpdate {
+    role: String,
+}
+
+async fn admin_set_user_role(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(username): Path<String>,
+    axum::Json(payload): axum::Json<AdminRoleUpdate>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let identity = verify_admin(&headers, &state).await?;
+    if identity.role != AccountRole::Superadmin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Only the superadmin can change administrator roles".to_string(),
+        ));
+    }
+    let username = username.trim();
+    if !is_valid_username(username) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid username".to_string()));
+    }
+    if state
+        .storage
+        .head_object_info(&state.bucket, &format!("users/{username}.json"))
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, "User not found".to_string()));
+    }
+    let promote = match payload.role.as_str() {
+        "admin" => true,
+        "user" => false,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Role must be admin or user".to_string(),
+            ))
+        }
+    };
+    update_promoted_admin(&state, username, promote).await?;
+    Ok(axum::Json(serde_json::json!({
+        "username": username,
+        "role": if promote { "admin" } else { "user" }
+    })))
+}
+
 async fn admin_delete_user(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(username): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    verify_admin(&headers, &state).await?;
+    let identity = verify_admin(&headers, &state).await?;
 
     let username = username.trim();
     if !is_valid_username(username) {
         return Err((StatusCode::BAD_REQUEST, "Invalid username".to_string()));
+    }
+    let target_role = account_role(&state, username)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    if target_role == AccountRole::Superadmin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "The superadmin account cannot be deleted".to_string(),
+        ));
+    }
+    if target_role == AccountRole::Admin && identity.role != AccountRole::Superadmin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Only the superadmin can delete an administrator".to_string(),
+        ));
     }
 
     let public_shares_key = format!("users/{}/public_shares.json", username);
@@ -4032,84 +4394,11 @@ async fn admin_delete_user(
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     delete_s3_prefix(&state.storage, &state.bucket, &user_folder_prefix).await?;
+    if target_role == AccountRole::Admin {
+        update_promoted_admin(&state, username, false).await?;
+    }
 
     Ok(StatusCode::OK)
-}
-
-async fn verify_admin_session(token: &str, state: &AppState) -> bool {
-    let (username, _expiry, session_id) = match verify_token_signature(token, &state.jwt_secret) {
-        Some(val) => val,
-        None => return false,
-    };
-
-    if username != "admin" {
-        return false;
-    }
-
-    let sessions_key = "admin/sessions.json";
-    let res = state
-        .storage
-        .get_object_bytes(&state.bucket, sessions_key)
-        .await;
-
-    match res {
-        Ok(bytes) => serde_json::from_slice::<Vec<UserSession>>(&bytes)
-            .is_ok_and(|sessions| sessions.iter().any(|session| session.id == session_id)),
-        Err(_) => false,
-    }
-}
-
-fn admin_bootstrap_secret() -> Result<String, (StatusCode, String)> {
-    let secret = std::env::var("ADMIN_TOKEN")
-        .map_err(|_| (StatusCode::FORBIDDEN, "Admin panel is disabled".to_string()))?;
-    if secret.len() < 32 {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ADMIN_TOKEN must contain at least 32 bytes".to_string(),
-        ));
-    }
-    Ok(secret)
-}
-
-async fn verify_admin(
-    headers: &axum::http::HeaderMap,
-    state: &AppState,
-) -> Result<(), (StatusCode, String)> {
-    let admin_token_env = admin_bootstrap_secret()?;
-
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                "Authorization header missing".to_string(),
-            )
-        })?;
-
-    let auth_str = auth_header.to_str().map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Invalid authorization characters".to_string(),
-        )
-    })?;
-
-    if !auth_str.starts_with("Bearer ") {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Authorization scheme must be Bearer".to_string(),
-        ));
-    }
-
-    let token = &auth_str[7..];
-    if secure_equal(token.as_bytes(), admin_token_env.as_bytes()) {
-        return Ok(());
-    }
-
-    if verify_admin_session(token, state).await {
-        return Ok(());
-    }
-
-    Err((StatusCode::FORBIDDEN, "Invalid admin token".to_string()))
 }
 
 async fn delete_s3_prefix(
@@ -4189,8 +4478,13 @@ async fn get_user_profile(
         }
     }
 
+    let role = account_role(&state, &username)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
     Ok(axum::Json(serde_json::json!({
         "username": username,
+        "role": role.as_str(),
         "pfp_enc": pfp_enc,
         "pfp": pfp_enc,
         "totp_enabled": totp_enabled
@@ -4464,6 +4758,15 @@ async fn user_delete_account(
             "Invalid or expired session".to_string(),
         )
     })?;
+    let role = account_role(&state, &username)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    if role == AccountRole::Superadmin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "The superadmin account cannot be deleted".to_string(),
+        ));
+    }
 
     let public_shares_key = format!("users/{}/public_shares.json", username);
     if let Ok(bytes) = state
@@ -4493,6 +4796,9 @@ async fn user_delete_account(
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
     delete_s3_prefix(&state.storage, &state.bucket, &user_folder_prefix).await?;
+    if role == AccountRole::Admin {
+        update_promoted_admin(&state, &username, false).await?;
+    }
 
     Ok(StatusCode::OK)
 }
@@ -4766,92 +5072,6 @@ async fn admin_revoke_user_session(
     }
 
     Ok(StatusCode::OK)
-}
-
-async fn admin_login(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let admin_token_env = admin_bootstrap_secret()?;
-
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                "Authorization header missing".to_string(),
-            )
-        })?;
-
-    let auth_str = auth_header.to_str().map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Invalid authorization characters".to_string(),
-        )
-    })?;
-
-    if !auth_str.starts_with("Bearer ") {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Authorization scheme must be Bearer".to_string(),
-        ));
-    }
-
-    let token = &auth_str[7..];
-    if !secure_equal(token.as_bytes(), admin_token_env.as_bytes()) {
-        return Err((StatusCode::FORBIDDEN, "Invalid admin token".to_string()));
-    }
-
-    let expiry = 0;
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let session_token = generate_token("admin", &state.jwt_secret, expiry, &session_id);
-
-    let (user_agent, ip) = request_client_metadata(&headers);
-
-    let new_session = UserSession {
-        id: session_id,
-        created_at: chrono::Utc::now().timestamp(),
-        user_agent,
-        ip,
-        expires_at: expiry,
-        name: None,
-    };
-
-    let sessions_key = "admin/sessions.json";
-    let mut sessions: Vec<UserSession> = match state
-        .storage
-        .get_object_bytes(&state.bucket, sessions_key)
-        .await
-    {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
-
-    sessions.push(new_session);
-    if sessions.len() > MAX_SESSIONS_PER_ACCOUNT {
-        sessions.sort_by_key(|session| session.created_at);
-        sessions.drain(..sessions.len() - MAX_SESSIONS_PER_ACCOUNT);
-    }
-
-    if let Ok(session_bytes) = serde_json::to_vec(&sessions) {
-        state
-            .storage
-            .put_object(
-                &state.bucket,
-                sessions_key,
-                session_bytes,
-                Some("application/json"),
-            )
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to save admin session: {:?}", e),
-                )
-            })?;
-    }
-
-    Ok(axum::Json(serde_json::json!({ "token": session_token })))
 }
 
 async fn admin_get_sessions(
