@@ -77,6 +77,7 @@ struct AppState {
     share_expiry_secs: i64,
     upload_session_max_secs: i64,
     max_share_bytes: i64,
+    session_revocations: tokio::sync::broadcast::Sender<String>,
 }
 
 #[tokio::main]
@@ -188,6 +189,7 @@ async fn main() {
         .unwrap_or(100 * 1024 * 1024 * 1024)
         .clamp(1024 * 1024, 5 * 1024 * 1024 * 1024 * 1024);
 
+    let (session_revocations, _) = tokio::sync::broadcast::channel(1024);
     let state = AppState {
         storage: storage.clone(),
         bucket: bucket.clone(),
@@ -197,6 +199,7 @@ async fn main() {
         share_expiry_secs: share_expiry_days * 24 * 60 * 60,
         upload_session_max_secs: upload_session_max_hours * 60 * 60,
         max_share_bytes,
+        session_revocations,
     };
 
     // Spawn background cleanup worker (runs every hour)
@@ -246,6 +249,7 @@ async fn main() {
         // Authentication routes
         .route("/api/register", post(register_user))
         .route("/api/login", post(login_user))
+        .route("/api/session/watch", get(watch_session))
         .route(
             "/api/user/shares",
             get(get_user_shares).post(save_user_shares),
@@ -4137,6 +4141,51 @@ async fn verify_session(token: &str, state: &AppState) -> Option<(String, String
     }
 }
 
+// Long-poll for revocations so an open browser is notified as soon as an
+// administrator (or another device) removes its session. The final storage
+// check also makes this work across multiple server instances.
+async fn watch_session(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let token = extract_token(&headers)?;
+    // Subscribe before checking storage so a revocation cannot land between
+    // validation and subscription.
+    let mut revocations = state.session_revocations.subscribe();
+    let (_, session_id) = verify_session(&token, &state).await.ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Invalid or expired session".to_string(),
+        )
+    })?;
+
+    let matching_revocation = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            match revocations.recv().await {
+                Ok(revoked_id) if revoked_id == session_id => return true,
+                Ok(_) => continue,
+                // A lagged receiver may have missed its own event, so force the
+                // authoritative storage check below.
+                Err(_) => return false,
+            }
+        }
+    })
+    .await;
+
+    if matches!(matching_revocation, Ok(true)) {
+        return Err((StatusCode::UNAUTHORIZED, "Session revoked".to_string()));
+    }
+
+    if verify_session(&token, &state).await.is_some() {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid or expired session".to_string(),
+        ))
+    }
+}
+
 // --- ADMIN HANDLERS ---
 
 async fn admin_get_stats(
@@ -4730,10 +4779,15 @@ async fn user_change_password(
         Err(_) => Vec::new(),
     };
 
+    let revoked_session_ids: Vec<String> = sessions
+        .iter()
+        .filter(|session| session.id != current_session_id)
+        .map(|session| session.id.clone())
+        .collect();
     sessions.retain(|s| s.id == current_session_id);
 
     if let Ok(session_bytes) = serde_json::to_vec(&sessions) {
-        let _ = state
+        if state
             .storage
             .put_object(
                 &state.bucket,
@@ -4741,7 +4795,13 @@ async fn user_change_password(
                 session_bytes,
                 Some("application/json"),
             )
-            .await;
+            .await
+            .is_ok()
+        {
+            for session_id in revoked_session_ids {
+                let _ = state.session_revocations.send(session_id);
+            }
+        }
     }
 
     Ok(StatusCode::OK)
@@ -4990,6 +5050,7 @@ async fn revoke_user_session(
                     format!("Failed to update sessions: {:?}", e),
                 )
             })?;
+        let _ = state.session_revocations.send(session_id);
     }
 
     Ok(StatusCode::OK)
@@ -5139,6 +5200,7 @@ async fn admin_revoke_user_session(
                     format!("Failed to update sessions: {:?}", e),
                 )
             })?;
+        let _ = state.session_revocations.send(session_id);
     }
 
     Ok(StatusCode::OK)
@@ -5518,6 +5580,7 @@ mod tests {
             share_expiry_secs: 3600,
             upload_session_max_secs: 3600,
             max_share_bytes: 1024 * 1024,
+            session_revocations: tokio::sync::broadcast::channel(16).0,
         };
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         write_active_upload_marker(

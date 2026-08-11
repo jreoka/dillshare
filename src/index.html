@@ -2813,7 +2813,6 @@
             if (viewId === 'view-profile') {
                 navProfile.classList.add('active');
                 loadUserProfileView();
-                loadUserPasskeysView();
             }
             if (viewId === 'view-admin') {
                 if (navAdmin) navAdmin.classList.add('active');
@@ -5309,6 +5308,55 @@
             if (role) localStorage.setItem('dill_role', role);
         }
 
+        let sessionWatchController = null;
+        let watchedSessionToken = null;
+
+        function stopSessionWatch() {
+            watchedSessionToken = null;
+            if (sessionWatchController) {
+                sessionWatchController.abort();
+                sessionWatchController = null;
+            }
+        }
+
+        function startSessionWatch() {
+            const token = localStorage.getItem('dill_session_token');
+            if (!token) {
+                stopSessionWatch();
+                return;
+            }
+            if (watchedSessionToken === token && sessionWatchController) return;
+
+            stopSessionWatch();
+            watchedSessionToken = token;
+            const controller = new AbortController();
+            sessionWatchController = controller;
+
+            (async () => {
+                while (!controller.signal.aborted && localStorage.getItem('dill_session_token') === token) {
+                    try {
+                        const res = await fetch('/api/session/watch', {
+                            headers: { 'Authorization': `Bearer ${token}` },
+                            cache: 'no-store',
+                            signal: controller.signal
+                        });
+                        if (res.status === 401 || res.status === 403) {
+                            handleInvalidSession();
+                            return;
+                        }
+                        if (!res.ok) {
+                            await new Promise(resolve => setTimeout(resolve, 2000));
+                        }
+                        // A successful long-poll response means the server timed
+                        // out the watch after revalidating it. Reconnect at once.
+                    } catch (error) {
+                        if (controller.signal.aborted) return;
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                    }
+                }
+            })();
+        }
+
         function updateHeaderAuthState() {
             const token = localStorage.getItem('dill_session_token');
             const username = localStorage.getItem('dill_username');
@@ -5339,10 +5387,17 @@
 
                 // Refresh the server-authoritative role on every page load so
                 // promotions and demotions take effect without another login.
+                startSessionWatch();
                 fetch('/api/user/profile', {
                     headers: { 'Authorization': `Bearer ${token}` }
-                }).then(res => res.ok ? res.json() : null).then(async profile => {
-                    if (!profile) return;
+                }).then(res => {
+                    if (res.status === 401 || res.status === 403) {
+                        handleInvalidSession();
+                        return null;
+                    }
+                    return res.ok ? res.json() : null;
+                }).then(async profile => {
+                    if (!profile || localStorage.getItem('dill_session_token') !== token) return;
                     setAdminRoleUi(profile.role || 'user');
                     const pfpEncHex = profile.pfp_enc || profile.pfp;
                     if (!storedPfp && pfpEncHex) {
@@ -5356,6 +5411,7 @@
                     }
                 }).catch(() => {});
             } else {
+                stopSessionWatch();
                 authBtn.style.display = 'block';
                 profileBadge.style.display = 'none';
                 if (navLinks) navLinks.style.display = 'none';
@@ -5451,8 +5507,8 @@
         const btnAuthPasskey = document.getElementById('btn-auth-passkey');
         if (btnAuthPasskey) {
             btnAuthPasskey.addEventListener('click', async () => {
-                const username = authUsernameInput.value.trim();
-
+                // Passkey sign-in is account-discoverable and intentionally does
+                // not use either credential field in the password form.
                 btnAuthPasskey.disabled = true;
                 const originalHtml = btnAuthPasskey.innerHTML;
                 btnAuthPasskey.innerHTML = `<div class="loader" style="width:0.85rem; height:0.85rem; border-width:1px; margin:0 auto; display:inline-block; vertical-align:middle;"></div>`;
@@ -5460,7 +5516,7 @@
                     let res = await fetch('/api/passkey/auth_start', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({username: username || null})
+                        body: JSON.stringify({username: null})
                     });
                     if (!res.ok) throw new Error(await res.text());
                     const startData = await res.json();
@@ -5502,7 +5558,7 @@
                     };
                     
                     let authFinishBody = {
-                        username: username || null,
+                        username: null,
                         session_id: sessionId,
                         auth: authData
                     };
@@ -5695,35 +5751,53 @@
             }
         }
 
-        async function logoutUser() {
-            const token = localStorage.getItem('dill_session_token');
-            // Revoke the current session on the server before clearing local state
-            if (token) {
-                try {
-                    const res = await fetch('/api/user/sessions', {
-                        headers: { 'Authorization': `Bearer ${token}` }
-                    });
-                    if (res.ok) {
-                        const sessions = await res.json();
-                        const current = sessions.find(s => s.is_current);
-                        if (current) {
-                            await fetch(`/api/user/sessions/${current.id}`, {
-                                method: 'DELETE',
-                                headers: { 'Authorization': `Bearer ${token}` }
-                            });
-                        }
-                    }
-                } catch (e) { /* ignore network errors during logout */ }
-            }
+        function clearLocalAuthState(message, type = 'info') {
+            stopSessionWatch();
             localStorage.removeItem('dill_session_token');
             localStorage.removeItem('dill_username');
             localStorage.removeItem('dill_role');
             localStorage.removeItem('dill_enc_key');
             localStorage.removeItem('dill_pfp');
-            showToast('Logged out successfully.', 'info');
-            updateHeaderAuthState();
-            
-            // Hide share result card & purge all DOM attributes/listeners on logout
+
+            // Purge account-derived values immediately. Private views must not
+            // keep displaying stale profile/session/share data after revocation.
+            const profileTitle = document.getElementById('profile-username-title');
+            if (profileTitle) profileTitle.textContent = '';
+            const profileImage = document.getElementById('settings-pfp-preview');
+            if (profileImage) {
+                profileImage.removeAttribute('src');
+                profileImage.style.display = 'none';
+            }
+            const profilePlaceholder = document.getElementById('settings-pfp-placeholder');
+            if (profilePlaceholder) profilePlaceholder.textContent = '';
+            const headerName = document.getElementById('header-username');
+            if (headerName) headerName.textContent = '';
+            const headerImage = document.getElementById('header-pfp');
+            if (headerImage) headerImage.removeAttribute('src');
+            const headerPlaceholder = document.getElementById('header-pfp-placeholder');
+            if (headerPlaceholder) headerPlaceholder.textContent = '';
+            const profileFileInput = document.getElementById('settings-pfp-input');
+            if (profileFileInput) profileFileInput.value = '';
+            const twoFactorSecret = document.getElementById('settings-2fa-secret');
+            if (twoFactorSecret) twoFactorSecret.value = '';
+            const twoFactorCode = document.getElementById('settings-2fa-code');
+            if (twoFactorCode) twoFactorCode.value = '';
+            const twoFactorQr = document.getElementById('settings-2fa-qr');
+            if (twoFactorQr) twoFactorQr.removeAttribute('src');
+            const passkeysContainer = document.getElementById('passkeys-list-container');
+            if (passkeysContainer) passkeysContainer.innerHTML = '';
+            const sessionsBody = document.getElementById('sessions-list-body');
+            if (sessionsBody) sessionsBody.innerHTML = '';
+            const accountSharesBody = document.getElementById('shares-list-body');
+            if (accountSharesBody) accountSharesBody.innerHTML = '';
+            const adminUsersBody = document.getElementById('admin-users-list-body');
+            if (adminUsersBody) adminUsersBody.innerHTML = '';
+            const adminDashboard = document.getElementById('admin-dashboard');
+            if (adminDashboard) adminDashboard.style.display = 'none';
+            if (settingsPasswordForm) settingsPasswordForm.reset();
+            if (deleteAccountForm) deleteAccountForm.reset();
+
+            // Hide share result card & purge all DOM attributes/listeners on logout.
             if (typeof shareResultCard !== 'undefined' && shareResultCard) {
                 shareResultCard.style.display = 'none';
             }
@@ -5742,14 +5816,46 @@
                 shareMsgInput.value = '';
                 if (msgCharCount) msgCharCount.textContent = '0 / 4000';
             }
-            if (typeof updateSelectedFilesUI === 'function') {
-                updateSelectedFilesUI();
-            }
+            if (typeof updateSelectedFilesUI === 'function') updateSelectedFilesUI();
 
+            updateHeaderAuthState();
             const activeTab = document.querySelector('.tab-content.active');
             if (activeTab && (activeTab.id === 'view-shares' || activeTab.id === 'view-admin' || activeTab.id === 'view-profile' || activeTab.id === 'view-sessions')) {
-                window.history.pushState({}, '', '/');
+                window.history.replaceState({}, '', '/');
                 showTab('view-upload');
+            }
+            if (message) showToast(message, type);
+        }
+
+        function handleInvalidSession() {
+            if (!localStorage.getItem('dill_session_token')) return;
+            clearLocalAuthState('Your session was revoked. Please sign in again.', 'info');
+        }
+
+        async function logoutUser() {
+            const token = localStorage.getItem('dill_session_token');
+            if (!token) return;
+            // Clear the page first; a network request must never delay removal of
+            // private values from the screen.
+            clearLocalAuthState('Logged out successfully.', 'info');
+
+            // Best-effort server revocation of the session that was just cleared.
+            if (token) {
+                try {
+                    const res = await fetch('/api/user/sessions', {
+                        headers: { 'Authorization': `Bearer ${token}` }
+                    });
+                    if (res.ok) {
+                        const sessions = await res.json();
+                        const current = sessions.find(s => s.is_current);
+                        if (current) {
+                            await fetch(`/api/user/sessions/${current.id}`, {
+                                method: 'DELETE',
+                                headers: { 'Authorization': `Bearer ${token}` }
+                            });
+                        }
+                    }
+                } catch (e) { /* local logout is already complete */ }
             }
         }
 
@@ -5957,7 +6063,7 @@
             }
         });
 
-        function loadUserProfileView() {
+        async function loadUserProfileView() {
             const token = localStorage.getItem('dill_session_token');
             const username = localStorage.getItem('dill_username');
             if (!token || !username) {
@@ -5966,64 +6072,79 @@
                 return;
             }
 
-            document.getElementById('profile-username-title').textContent = username;
+            // Do not render cached identity/profile values until this exact
+            // session has been validated by the server.
+            const profileTitle = document.getElementById('profile-username-title');
+            const settingsPfpPreview = document.getElementById('settings-pfp-preview');
+            const settingsPfpPlaceholder = document.getElementById('settings-pfp-placeholder');
+            const statusText = document.getElementById('settings-2fa-status-text');
+            const toggleBtn = document.getElementById('btn-toggle-2fa');
+            profileTitle.textContent = '';
+            settingsPfpPreview.removeAttribute('src');
+            settingsPfpPreview.style.display = 'none';
+            settingsPfpPlaceholder.style.display = 'flex';
+            settingsPfpPlaceholder.textContent = '';
+            statusText.textContent = 'Verifying session...';
+            toggleBtn.style.display = 'none';
+            document.getElementById('passkeys-list-container').innerHTML = '';
             deleteAccountForm.reset();
             deleteAccountForm.style.display = 'none';
             deleteTotpWrap.style.display = 'none';
             deleteTotpInput.required = false;
             deleteAccountDescription.textContent = 'Checking account deletion permissions...';
-            
-            const currentPfp = localStorage.getItem('dill_pfp');
-            const settingsPfpPreview = document.getElementById('settings-pfp-preview');
-            const settingsPfpPlaceholder = document.getElementById('settings-pfp-placeholder');
-            
-            if (currentPfp) {
-                settingsPfpPreview.src = currentPfp;
-                settingsPfpPreview.style.display = 'block';
-                settingsPfpPlaceholder.style.display = 'none';
-            } else {
-                settingsPfpPreview.style.display = 'none';
-                settingsPfpPlaceholder.style.display = 'flex';
-                settingsPfpPlaceholder.textContent = username.substring(0, 1).toUpperCase();
-            }
 
-            // Fetch profile for 2FA status
-            fetch('/api/user/profile', {
-                headers: { 'Authorization': `Bearer ${token}` }
-            }).then(res => {
-                if (res.ok) return res.json();
-            }).then(profile => {
-                if (profile) {
-                    const role = profile.role || 'user';
-                    setAdminRoleUi(role);
-                    const statusText = document.getElementById('settings-2fa-status-text');
-                    const toggleBtn = document.getElementById('btn-toggle-2fa');
-
-                    if (role === 'superadmin') {
-                        deleteAccountDescription.textContent = 'The superadmin account is protected and cannot be deleted.';
-                        deleteAccountForm.style.display = 'none';
-                    } else {
-                        deleteAccountDescription.textContent = 'Deleting your account is permanent and irreversible. Enter your account password and, if enabled, your 2FA code. This will instantly delete your profile and ALL files uploaded under your active shares.';
-                        deleteAccountForm.style.display = 'flex';
-                        deleteTotpWrap.style.display = profile.totp_enabled ? 'flex' : 'none';
-                        deleteTotpInput.required = !!profile.totp_enabled;
-                    }
-                    
-                    if (profile.totp_enabled) {
-                        statusText.textContent = '2FA is enabled.';
-                        statusText.style.color = 'var(--primary)';
-                        toggleBtn.textContent = 'Disable';
-                        toggleBtn.classList.replace('btn-secondary', 'btn-danger');
-                    } else {
-                        statusText.textContent = '2FA is disabled.';
-                        statusText.style.color = 'var(--text-muted)';
-                        toggleBtn.textContent = 'Enable';
-                        toggleBtn.classList.replace('btn-danger', 'btn-secondary');
-                    }
-                    toggleBtn.style.display = 'inline-block';
-                    document.getElementById('settings-2fa-setup-wrap').style.display = 'none';
+            try {
+                const res = await fetch('/api/user/profile', {
+                    headers: { 'Authorization': `Bearer ${token}` },
+                    cache: 'no-store'
+                });
+                if (res.status === 401 || res.status === 403) {
+                    handleInvalidSession();
+                    return;
                 }
-            });
+                if (!res.ok) throw new Error(await res.text());
+                const profile = await res.json();
+                if (localStorage.getItem('dill_session_token') !== token) return;
+
+                profileTitle.textContent = username;
+                const currentPfp = localStorage.getItem('dill_pfp');
+                if (currentPfp) {
+                    settingsPfpPreview.src = currentPfp;
+                    settingsPfpPreview.style.display = 'block';
+                    settingsPfpPlaceholder.style.display = 'none';
+                } else {
+                    settingsPfpPlaceholder.textContent = username.substring(0, 1).toUpperCase();
+                }
+
+                const role = profile.role || 'user';
+                setAdminRoleUi(role);
+                if (role === 'superadmin') {
+                    deleteAccountDescription.textContent = 'The superadmin account is protected and cannot be deleted.';
+                } else {
+                    deleteAccountDescription.textContent = 'Deleting your account is permanent and irreversible. Enter your account password and, if enabled, your 2FA code. This will instantly delete your profile and ALL files uploaded under your active shares.';
+                    deleteAccountForm.style.display = 'flex';
+                    deleteTotpWrap.style.display = profile.totp_enabled ? 'flex' : 'none';
+                    deleteTotpInput.required = !!profile.totp_enabled;
+                }
+
+                if (profile.totp_enabled) {
+                    statusText.textContent = '2FA is enabled.';
+                    statusText.style.color = 'var(--primary)';
+                    toggleBtn.textContent = 'Disable';
+                    toggleBtn.classList.replace('btn-secondary', 'btn-danger');
+                } else {
+                    statusText.textContent = '2FA is disabled.';
+                    statusText.style.color = 'var(--text-muted)';
+                    toggleBtn.textContent = 'Enable';
+                    toggleBtn.classList.replace('btn-danger', 'btn-secondary');
+                }
+                toggleBtn.style.display = 'inline-block';
+                document.getElementById('settings-2fa-setup-wrap').style.display = 'none';
+                loadUserPasskeysView();
+            } catch (error) {
+                statusText.textContent = 'Unable to load profile.';
+                deleteAccountDescription.textContent = 'Unable to verify account permissions.';
+            }
         }
 
         const btnSetupPasskey = document.getElementById('btn-setup-passkey');
@@ -6795,8 +6916,13 @@
                 });
 
                 if (!res.ok) {
+                    if (res.status === 401 || res.status === 403) {
+                        handleInvalidSession();
+                        return;
+                    }
                     throw new Error(await res.text());
                 }
+                if (localStorage.getItem('dill_session_token') !== token) return;
 
                 const passkeys = await res.json();
                 passkeysListContainer.innerHTML = '';
@@ -6903,8 +7029,8 @@
                 });
 
                 if (!res.ok) {
-                    if (res.status === 401) {
-                        logoutUser();
+                    if (res.status === 401 || res.status === 403) {
+                        handleInvalidSession();
                         return;
                     }
                     throw new Error(await res.text());
