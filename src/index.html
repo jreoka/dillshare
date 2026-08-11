@@ -1466,10 +1466,20 @@
                 <!-- Delete Account Section -->
                 <div style="display: flex; flex-direction: column; gap: 0.8rem;">
                     <h4 style="font-size: 0.9rem; font-weight: 600; color: var(--danger); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.25rem;">Danger Zone</h4>
-                    <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.2rem;">Deleting your account is permanent and irreversible. It will instantly delete your profile and ALL files uploaded under your active shares.</p>
-                    <button class="btn btn-danger" id="btn-delete-account" style="justify-content: center; padding: 0.6rem; font-weight: 600; font-size: 0.85rem; width: 100%;">
-                        Permanently Delete Account
-                    </button>
+                    <p id="delete-account-description" style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.2rem;">Checking account deletion permissions...</p>
+                    <form id="delete-account-form" style="display: none; flex-direction: column; gap: 0.8rem;">
+                        <div style="display: flex; flex-direction: column; gap: 0.4rem;">
+                            <label for="settings-delete-password" style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500;">Account Password</label>
+                            <input type="password" id="settings-delete-password" required autocomplete="current-password" style="background: rgba(0,0,0,0.2); border: 1px solid var(--surface-border); border-radius: 4px; padding: 0.5rem 0.75rem; color: var(--text-main); font-family: inherit; font-size: 0.85rem; outline: none; width: 100%;">
+                        </div>
+                        <div id="settings-delete-2fa-wrap" style="display: none; flex-direction: column; gap: 0.4rem;">
+                            <label for="settings-delete-2fa-code" style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500;">Two-Factor Authentication Code</label>
+                            <input type="text" id="settings-delete-2fa-code" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="one-time-code" placeholder="Enter 6-digit code" style="background: rgba(0,0,0,0.2); border: 1px solid var(--surface-border); border-radius: 4px; padding: 0.5rem 0.75rem; color: var(--text-main); font-family: monospace; font-size: 0.85rem; letter-spacing: 2px; outline: none; width: 100%;">
+                        </div>
+                        <button type="submit" class="btn btn-danger" id="btn-delete-account" style="justify-content: center; padding: 0.6rem; font-weight: 600; font-size: 0.85rem; width: 100%;">
+                            Permanently Delete Account
+                        </button>
+                    </form>
                 </div>
 
             </div>
@@ -5751,6 +5761,11 @@
         const settingsPfpPlaceholder = document.getElementById('settings-pfp-placeholder');
         const settingsPasswordForm = document.getElementById('settings-password-form');
         const btnSettingsPasswordSubmit = document.getElementById('btn-settings-password-submit');
+        const deleteAccountForm = document.getElementById('delete-account-form');
+        const deleteAccountDescription = document.getElementById('delete-account-description');
+        const deletePasswordInput = document.getElementById('settings-delete-password');
+        const deleteTotpWrap = document.getElementById('settings-delete-2fa-wrap');
+        const deleteTotpInput = document.getElementById('settings-delete-2fa-code');
         const btnDeleteAccount = document.getElementById('btn-delete-account');
         const headerUsername = document.getElementById('header-username');
 
@@ -5892,37 +5907,53 @@
             }
         });
 
-        btnDeleteAccount.addEventListener('click', async () => {
+        deleteAccountForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
             const token = localStorage.getItem('dill_session_token');
-            if (!token) return;
+            const username = localStorage.getItem('dill_username');
+            const password = deletePasswordInput.value;
+            const totpCode = deleteTotpInput.value.trim();
+            if (!token || !username || !password) return;
 
-            if (await customConfirm("CRITICAL WARNING: Are you sure you want to permanently delete your account?\n\nThis will delete your user profile and ALL S3 files uploaded under your shares. This action cannot be undone.", 'Delete Account', 'Permanently Delete', true)) {
-                btnDeleteAccount.disabled = true;
-                btnDeleteAccount.textContent = 'Deleting Account...';
+            if (!await customConfirm("CRITICAL WARNING: Are you sure you want to permanently delete your account?\n\nThis will delete your user profile and ALL S3 files uploaded under your shares. This action cannot be undone.", 'Delete Account', 'Permanently Delete', true)) {
+                return;
+            }
 
-                try {
-                    const res = await fetch('/api/user', {
-                        method: 'DELETE',
-                        headers: { 'Authorization': `Bearer ${token}` }
-                    });
+            btnDeleteAccount.disabled = true;
+            btnDeleteAccount.textContent = 'Deleting Account...';
 
-                    if (res.ok) {
-                        showToast('Your account and all shares have been permanently deleted.', 'success');
+            try {
+                const { authKeyHex } = await deriveUserKeys(username, password);
+                const res = await fetch('/api/user', {
+                    method: 'DELETE',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        auth_key: authKeyHex,
+                        totp_code: totpCode || null
+                    })
+                });
+
+                if (res.ok) {
+                    showToast('Your account and all shares have been permanently deleted.', 'success');
+                    await logoutUser();
+                } else {
+                    if (res.status === 401) {
+                        showToast('Your session has expired. Please sign in again.', 'info');
                         logoutUser();
-                    } else {
-                        if (res.status === 401) {
-                            showToast('Your session has expired. Please sign in again.', 'info');
-                            logoutUser();
-                            return;
-                        }
-                        showToast('Failed to delete account: ' + await res.text(), 'error');
+                        return;
                     }
-                } catch (err) {
-                    showToast('Network error during account deletion', 'error');
-                } finally {
-                    btnDeleteAccount.disabled = false;
-                    btnDeleteAccount.textContent = 'Permanently Delete Account';
+                    showToast('Failed to delete account: ' + await res.text(), 'error');
                 }
+            } catch (err) {
+                showToast('Failed to verify account credentials. Please try again.', 'error');
+            } finally {
+                deletePasswordInput.value = '';
+                deleteTotpInput.value = '';
+                btnDeleteAccount.disabled = false;
+                btnDeleteAccount.textContent = 'Permanently Delete Account';
             }
         });
 
@@ -5936,6 +5967,11 @@
             }
 
             document.getElementById('profile-username-title').textContent = username;
+            deleteAccountForm.reset();
+            deleteAccountForm.style.display = 'none';
+            deleteTotpWrap.style.display = 'none';
+            deleteTotpInput.required = false;
+            deleteAccountDescription.textContent = 'Checking account deletion permissions...';
             
             const currentPfp = localStorage.getItem('dill_pfp');
             const settingsPfpPreview = document.getElementById('settings-pfp-preview');
@@ -5958,9 +5994,20 @@
                 if (res.ok) return res.json();
             }).then(profile => {
                 if (profile) {
-                    setAdminRoleUi(profile.role || 'user');
+                    const role = profile.role || 'user';
+                    setAdminRoleUi(role);
                     const statusText = document.getElementById('settings-2fa-status-text');
                     const toggleBtn = document.getElementById('btn-toggle-2fa');
+
+                    if (role === 'superadmin') {
+                        deleteAccountDescription.textContent = 'The superadmin account is protected and cannot be deleted.';
+                        deleteAccountForm.style.display = 'none';
+                    } else {
+                        deleteAccountDescription.textContent = 'Deleting your account is permanent and irreversible. Enter your account password and, if enabled, your 2FA code. This will instantly delete your profile and ALL files uploaded under your active shares.';
+                        deleteAccountForm.style.display = 'flex';
+                        deleteTotpWrap.style.display = profile.totp_enabled ? 'flex' : 'none';
+                        deleteTotpInput.required = !!profile.totp_enabled;
+                    }
                     
                     if (profile.totp_enabled) {
                         statusText.textContent = '2FA is enabled.';

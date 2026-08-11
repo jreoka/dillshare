@@ -4747,9 +4747,17 @@ async fn user_change_password(
     Ok(StatusCode::OK)
 }
 
+#[derive(serde::Deserialize)]
+struct DeleteAccountRequest {
+    auth_key: String,
+    #[serde(default)]
+    totp_code: Option<String>,
+}
+
 async fn user_delete_account(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
+    axum::Json(payload): axum::Json<DeleteAccountRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let token = extract_token(&headers)?;
     let (username, _) = verify_session(&token, &state).await.ok_or_else(|| {
@@ -4766,6 +4774,69 @@ async fn user_delete_account(
             StatusCode::FORBIDDEN,
             "The superadmin account cannot be deleted".to_string(),
         ));
+    }
+    if !is_valid_auth_key(&payload.auth_key) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid authentication key".to_string(),
+        ));
+    }
+
+    let user_profile_key = format!("users/{}.json", username);
+    let user_bytes = state
+        .storage
+        .get_object_bytes(&state.bucket, &user_profile_key)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "User profile not found".to_string()))?;
+    let user_json: serde_json::Value = serde_json::from_slice(&user_bytes)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let stored_hash = user_json
+        .get("password_hash")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid user profile data in S3".to_string(),
+            )
+        })?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(payload.auth_key.as_bytes());
+    hasher.update(b"server-salt-dill-share");
+    let computed_hash = format!("{:02x}", hasher.finalize());
+    if !secure_equal(computed_hash.as_bytes(), stored_hash.as_bytes()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Incorrect account password".to_string(),
+        ));
+    }
+
+    let totp_enabled = user_json
+        .get("totp_enabled")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if totp_enabled {
+        let totp_secret = user_json
+            .get("totp_secret")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let totp_code = payload
+            .totp_code
+            .as_deref()
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+            .ok_or_else(|| {
+                (
+                    StatusCode::FORBIDDEN,
+                    "Two-factor authentication code is required".to_string(),
+                )
+            })?;
+        if !verify_totp_code(totp_secret, &username, totp_code)? {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Invalid two-factor authentication code".to_string(),
+            ));
+        }
     }
 
     let public_shares_key = format!("users/{}/public_shares.json", username);
@@ -4787,7 +4858,6 @@ async fn user_delete_account(
         }
     }
 
-    let user_profile_key = format!("users/{}.json", username);
     let user_folder_prefix = format!("users/{}/", username);
 
     state
