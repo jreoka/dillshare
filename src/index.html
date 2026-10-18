@@ -2212,10 +2212,10 @@
                 const workerCode = `
                     const keysMap = new Map();
                     self.onmessage = async (e) => {
-                        const { id, type, iv, ct, keyRaw } = e.data;
+                        const { id, type, iv, ct, keyRaw, keyId } = e.data;
                         if (type === 'decrypt') {
                             try {
-                                let key = keysMap.get(keyRaw.buffer);
+                                let key = keysMap.get(keyId);
                                 if (!key) {
                                     key = await self.crypto.subtle.importKey(
                                         'raw',
@@ -2225,7 +2225,7 @@
                                         ['decrypt']
                                     );
                                     if (keysMap.size > 10) keysMap.clear();
-                                    keysMap.set(keyRaw.buffer, key);
+                                    keysMap.set(keyId, key);
                                 }
                                 const ptBuf = await self.crypto.subtle.decrypt(
                                     { name: 'AES-GCM', iv },
@@ -2260,7 +2260,11 @@
                 return new Promise((resolve, reject) => {
                     const id = this.nextId++;
                     this.activeTasks.set(id, { resolve, reject });
-                    this.taskQueue.push({ id, iv, ct, keyRaw, bufferToTransfer });
+                    // Cache key must be content-derived: every postMessage copies
+                    // the key bytes into a fresh ArrayBuffer, so buffer identity
+                    // can never hit and the pool would re-import the key per chunk.
+                    const keyId = bufToHex(keyRaw.subarray(0, 16));
+                    this.taskQueue.push({ id, iv, ct, keyRaw, keyId, bufferToTransfer });
                     this._processQueue();
                 });
             }
@@ -2277,6 +2281,7 @@
                         type: 'decrypt',
                         iv: task.iv,
                         ct: task.ct,
+                        keyId: task.keyId,
                         keyRaw: task.keyRaw
                     }, transfers);
                 }
@@ -2401,6 +2406,9 @@
             for (let idx = 0; idx < totalChunks; idx++) {
                 const thisPlain = Math.min(chunkSize, remYield);
                 const pt = await decryptPromises[idx];
+                // Release the reference immediately: the promise array would
+                // otherwise pin every decrypted chunk for the whole download.
+                decryptPromises[idx] = null;
                 yield pt;
                 remYield -= thisPlain;
                 bytesDecrypted += thisPlain;
@@ -2462,6 +2470,11 @@
                 const NETWORK_CONCURRENCY = Math.max(6, Math.min(16, (navigator.hardwareConcurrency || 4) * 2));
                 let nextChunkToFetch = 0;
                 let isAborted = false;
+                // How many chunks may be fetched+decrypted ahead of the sink.
+                // Without this the fetch workers outrun a slow disk and buffer
+                // the entire (decrypted) file in memory.
+                const MAX_CHUNKS_AHEAD = NETWORK_CONCURRENCY + 8;
+                let consumedChunks = 0;
 
                 const checkAbort = () => {
                     if (signal && signal.aborted) isAborted = true;
@@ -2487,6 +2500,15 @@
 
                 async function fetchWorker() {
                     while (nextChunkToFetch < totalChunks && !checkAbort()) {
+                        // Backpressure: hold the network at the consumer's pace
+                        // instead of letting decrypted chunks pile up unbounded.
+                        while (
+                            nextChunkToFetch > consumedChunks + MAX_CHUNKS_AHEAD &&
+                            !checkAbort()
+                        ) {
+                            await new Promise(resolve => setTimeout(resolve, 20));
+                        }
+                        if (checkAbort()) break;
                         const chunkIdx = nextChunkToFetch++;
                         const meta = chunkMeta[chunkIdx];
                         try {
@@ -2533,14 +2555,24 @@
 
                 let bytesDecrypted = 0;
                 let remYield = totalPlaintextSize;
-                for (let idx = 0; idx < totalChunks; idx++) {
-                    if (checkAbort()) throw new Error('Download aborted');
-                    const thisPlain = Math.min(chunkSize, remYield);
-                    const pt = await promises[idx];
-                    yield pt;
-                    remYield -= thisPlain;
-                    bytesDecrypted += thisPlain;
-                    if (onProgress) onProgress({ bytesReceived: bytesDecrypted, bytesDecrypted, totalBytes: totalPlaintextSize });
+                try {
+                    for (let idx = 0; idx < totalChunks; idx++) {
+                        if (checkAbort()) throw new Error('Download aborted');
+                        const thisPlain = Math.min(chunkSize, remYield);
+                        const pt = await promises[idx];
+                        // Drop the reference so the decrypted chunk can be freed
+                        // as soon as the consumer is done with it.
+                        promises[idx] = null;
+                        consumedChunks = idx + 1;
+                        yield pt;
+                        remYield -= thisPlain;
+                        bytesDecrypted += thisPlain;
+                        if (onProgress) onProgress({ bytesReceived: bytesDecrypted, bytesDecrypted, totalBytes: totalPlaintextSize });
+                    }
+                } finally {
+                    // If the consumer stops early (error, sink cancel, break) the
+                    // fetch workers must stop too instead of looping forever.
+                    isAborted = true;
                 }
                 return;
             }
@@ -5582,7 +5614,15 @@
                     const finalData = await finishRes.json();
                     
                     const loggedInUsername = finalData.username;
-                    let encKeyHex = localStorage.getItem('dill_enc_key_' + loggedInUsername) || localStorage.getItem('dill_enc_key');
+                    // Only reuse the generic slot when it belongs to this same
+                    // account. Otherwise a passkey sign-in after somebody else
+                    // used this browser would silently adopt their encryption
+                    // key and encrypt/decrypt this account's data with it.
+                    let cachedKey = localStorage.getItem('dill_enc_key_' + loggedInUsername);
+                    const genericKey = localStorage.getItem('dill_username') === loggedInUsername
+                        ? localStorage.getItem('dill_enc_key')
+                        : null;
+                    let encKeyHex = cachedKey || genericKey;
                     if (!encKeyHex) {
                         const pwd = await customPrompt('Please enter your password once to unlock zero-knowledge encryption on this device:', 'Unlock Device Encryption', '', true);
                         if (!pwd) {
@@ -6876,13 +6916,14 @@
             else if (ua.indexOf('iPad') !== -1) os = 'iOS (iPad)';
             else if (ua.indexOf('Linux') !== -1) os = 'Linux';
 
-            // Simple Browser detection
-            if (ua.indexOf('Firefox') !== -1) browser = 'Firefox';
+            // Simple Browser detection (edge cases first: Edge and Opera also
+            // advertise "Chrome"/"Safari" in their user agent).
+            if (ua.indexOf('Edg') !== -1) browser = 'Edge';
+            else if (ua.indexOf('OPR') !== -1 || ua.indexOf('Opera') !== -1) browser = 'Opera';
             else if (ua.indexOf('SamsungBrowser') !== -1) browser = 'Samsung Browser';
+            else if (ua.indexOf('Firefox') !== -1) browser = 'Firefox';
             else if (ua.indexOf('Chrome') !== -1) browser = 'Chrome';
             else if (ua.indexOf('Safari') !== -1) browser = 'Safari';
-            else if (ua.indexOf('Edge') !== -1) browser = 'Edge';
-            else if (ua.indexOf('Opera') !== -1 || ua.indexOf('OPR') !== -1) browser = 'Opera';
 
             return `${browser} on ${os}`;
         }

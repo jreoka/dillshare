@@ -200,6 +200,45 @@ impl Storage {
         }
     }
 
+    /// Fetch an object, distinguishing "does not exist" from a real storage
+    /// failure. Callers that would otherwise mistake an outage for an empty
+    /// document (and then overwrite it) must use this instead of
+    /// `get_object_bytes`.
+    pub async fn get_object_bytes_optional(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            Storage::S3(client) => match client.get_object().bucket(bucket).key(key).send().await {
+                Ok(response) => {
+                    let bytes = response
+                        .body
+                        .collect()
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .into_bytes()
+                        .to_vec();
+                    Ok(Some(bytes))
+                }
+                Err(error) => {
+                    use aws_smithy_types::error::metadata::ProvideErrorMetadata;
+                    if let aws_sdk_s3::error::SdkError::ServiceError(service_error) = &error {
+                        let code = service_error.err().code().unwrap_or_default();
+                        if matches!(code, "NoSuchKey" | "NotFound" | "404") {
+                            return Ok(None);
+                        }
+                    }
+                    Err(error.to_string())
+                }
+            },
+            Storage::Memory(mem) => {
+                let m = mem.lock().await;
+                Ok(m.files.get(key).cloned())
+            }
+        }
+    }
+
     pub async fn get_object_bytes_with_etag(
         &self,
         bucket: &str,

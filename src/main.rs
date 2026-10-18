@@ -19,6 +19,11 @@ async fn url_restriction_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, axum::http::StatusCode> {
+    // Kubernetes/container probes talk to the pod address, not the public
+    // origin, so the liveness endpoint bypasses the Host/Origin restriction.
+    if req.uri().path() == "/healthz" {
+        return Ok(next.run(req).await);
+    }
     if let Some(origin) = allowed_origin {
         let expected = webauthn_rs::prelude::Url::parse(&origin)
             .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -76,10 +81,111 @@ struct AppState {
     presign_ttl: std::time::Duration,
     upload_session_max_secs: i64,
     session_revocations: tokio::sync::broadcast::Sender<String>,
+    /// Per-account budget: a handful of wrong passwords for one name.
+    login_limiter: std::sync::Arc<RateLimiter>,
+    /// Per-client-address budget, deliberately looser than the account budget so
+    /// one person mistyping behind a shared NAT cannot lock out their colleagues.
+    login_ip_limiter: std::sync::Arc<RateLimiter>,
+    registration_limiter: std::sync::Arc<RateLimiter>,
+}
+
+/// Small fixed-window failure counter used to slow down credential guessing.
+///
+/// Everything is in-memory: a restart clears the counters and multiple
+/// instances keep independent budgets. That is intentional - the goal is to
+/// make online brute force and TOTP guessing impractical, not to be an
+/// authoritative global quota.
+struct RateLimiter {
+    window: std::time::Duration,
+    max_failures: u32,
+    entries: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u32)>>,
+}
+
+impl RateLimiter {
+    fn new(window: std::time::Duration, max_failures: u32) -> Self {
+        Self {
+            window,
+            max_failures,
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, (std::time::Instant, u32)>>
+    {
+        // A poisoned lock only means another request panicked while holding it;
+        // the map is still structurally valid, so recover instead of failing.
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `Some(seconds)` when this key is currently over budget.
+    fn retry_after(&self, key: &str) -> Option<u64> {
+        let now = std::time::Instant::now();
+        let entries = self.lock();
+        let (started, count) = entries.get(key)?;
+        let elapsed = now.saturating_duration_since(*started);
+        if elapsed >= self.window || *count < self.max_failures {
+            return None;
+        }
+        Some((self.window - elapsed).as_secs().max(1))
+    }
+
+    fn record_failure(&self, key: &str) {
+        let now = std::time::Instant::now();
+        let mut entries = self.lock();
+        if entries.len() > 10_000 {
+            entries.retain(|_, (started, _)| now.saturating_duration_since(*started) < self.window);
+        }
+        match entries.get_mut(key) {
+            Some((started, count)) if now.saturating_duration_since(*started) < self.window => {
+                *count = count.saturating_add(1);
+            }
+            _ => {
+                entries.insert(key.to_string(), (now, 1));
+            }
+        }
+    }
+
+    fn clear(&self, key: &str) {
+        self.lock().remove(key);
+    }
+}
+
+fn client_ip(headers: &axum::http::HeaderMap) -> String {
+    request_client_metadata(headers).1
+}
+
+fn too_many_attempts() -> (StatusCode, String) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        "Too many failed attempts. Please wait a few minutes and try again.".to_string(),
+    )
+}
+
+fn configured_port() -> u16 {
+    std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8000)
 }
 
 #[tokio::main]
 async fn main() {
+    // Container health probe: succeeds when the listener accepts connections.
+    // Deliberately shallow - an object-storage outage must not restart a
+    // process that is otherwise serving requests correctly.
+    if std::env::args().skip(1).any(|arg| arg == "--healthcheck") {
+        let port = configured_port();
+        let code = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(_) => 0,
+            Err(_) => 1,
+        };
+        std::process::exit(code);
+    }
+
     // Load .env file if it exists
     dotenvy::dotenv().ok();
 
@@ -185,6 +291,18 @@ async fn main() {
         presign_ttl: std::time::Duration::from_secs(presign_ttl_secs),
         upload_session_max_secs: upload_session_max_hours * 60 * 60,
         session_revocations,
+        login_limiter: std::sync::Arc::new(RateLimiter::new(
+            std::time::Duration::from_secs(15 * 60),
+            10,
+        )),
+        login_ip_limiter: std::sync::Arc::new(RateLimiter::new(
+            std::time::Duration::from_secs(15 * 60),
+            50,
+        )),
+        registration_limiter: std::sync::Arc::new(RateLimiter::new(
+            std::time::Duration::from_secs(60 * 60),
+            20,
+        )),
     };
 
     // Spawn background cleanup worker (runs every hour)
@@ -243,7 +361,10 @@ async fn main() {
             "/api/user/profile",
             get(get_user_profile).post(save_user_profile),
         )
-        .route("/api/user/password", put(user_change_password))
+        .route(
+            "/api/user/password",
+            put(user_change_password).post(user_change_password),
+        )
         .route("/api/user", delete(user_delete_account))
         // Passkey routes
         .route("/api/passkey/register_start", post(passkey_register_start))
@@ -283,6 +404,10 @@ async fn main() {
         )
         // Static assets/routing (all fallback to SPA index.html)
         .route("/", get(serve_index))
+        // Liveness probe. Deliberately independent of storage so an S3 outage
+        // does not restart a healthy process, and exempt from the Host check so
+        // in-cluster probes work when URL pins a public origin.
+        .route("/healthz", get(healthz))
         .route("/shares", get(serve_index))
         .route("/share/:uuid", get(serve_index))
         .route("/admin", get(serve_index))
@@ -330,10 +455,7 @@ async fn main() {
         .layer(axum::middleware::from_fn(url_restriction_middleware))
         .layer(axum::Extension(allowed_url));
 
-    let port = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(8000);
+    let port = configured_port();
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("Dill Share server running at http://localhost:{}", port);
@@ -571,6 +693,16 @@ async fn passkey_auth_finish(
     if username_opt.is_some_and(|username| !is_valid_username(username)) {
         return Err((StatusCode::BAD_REQUEST, "Invalid username".to_string()));
     }
+    // Share the login budget with password sign-in: passkey + TOTP guessing
+    // must not be a way around the per-address limit.
+    let passkey_ip_key = format!("login:ip:{}", client_ip(&headers));
+    if state
+        .login_ip_limiter
+        .retry_after(&passkey_ip_key)
+        .is_some()
+    {
+        return Err(too_many_attempts());
+    }
     let is_discoverable = username_opt.is_none();
     let session_id = payload
         .session_id
@@ -675,36 +807,12 @@ async fn passkey_auth_finish(
         (username_opt.unwrap().to_string(), auth_res)
     };
 
-    let passkeys_key = format!("users/{}/passkeys.json", username);
-    let mut passkeys: Vec<webauthn_rs::prelude::Passkey> = match state
-        .storage
-        .get_object_bytes(&state.bucket, &passkeys_key)
-        .await
-    {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => vec![],
-    };
-
-    for pk in passkeys.iter_mut() {
-        if pk.cred_id() == auth_res.cred_id() {
-            pk.update_credential(&auth_res);
-            break;
-        }
-    }
-    let passkeys_json = serde_json::to_vec(&passkeys)
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    state
-        .storage
-        .put_object(
-            &state.bucket,
-            &passkeys_key,
-            passkeys_json,
-            Some("application/json"),
-        )
-        .await
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
-    // Check 2FA before finalizing
+    // Check 2FA before persisting the new signature counter or issuing a session.
+    //
+    // Ordering matters: updating the stored passkey counter first would make the
+    // browser's retry (same assertion, now with the 2FA code) look like a
+    // replayed/cloned credential to webauthn-rs and lock every passkey+2FA user
+    // out of their account.
     let user_key = format!("users/{}.json", username);
     let user_bytes = state
         .storage
@@ -731,12 +839,47 @@ async fn passkey_auth_finish(
             .unwrap_or("");
         if let Some(code) = &payload.totp_code {
             if !verify_totp_code(totp_secret, &username, code)? {
+                state
+                    .login_ip_limiter
+                    .record_failure(&format!("login:ip:{}", client_ip(&headers)));
+                state
+                    .login_limiter
+                    .record_failure(&format!("login:user:{}", username));
                 return Err((StatusCode::FORBIDDEN, "INVALID_2FA".to_string()));
             }
         } else {
             return Err((StatusCode::FORBIDDEN, "2FA_REQUIRED".to_string()));
         }
     }
+
+    // 2FA passed: now persist the new signature counter for this credential.
+    let passkeys_key = format!("users/{}/passkeys.json", username);
+    let mut passkeys: Vec<webauthn_rs::prelude::Passkey> = match state
+        .storage
+        .get_object_bytes(&state.bucket, &passkeys_key)
+        .await
+    {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => vec![],
+    };
+    for pk in passkeys.iter_mut() {
+        if pk.cred_id() == auth_res.cred_id() {
+            pk.update_credential(&auth_res);
+            break;
+        }
+    }
+    let passkeys_json = serde_json::to_vec(&passkeys)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    state
+        .storage
+        .put_object(
+            &state.bucket,
+            &passkeys_key,
+            passkeys_json,
+            Some("application/json"),
+        )
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     let _ = state.storage.delete_object(&state.bucket, &state_key).await;
 
@@ -995,6 +1138,22 @@ async fn api_not_found() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "API endpoint not found")
 }
 
+async fn healthz() -> impl IntoResponse {
+    (
+        [
+            (
+                axum::http::header::CACHE_CONTROL,
+                "no-store, must-revalidate",
+            ),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            ),
+        ],
+        "ok",
+    )
+}
+
 // Serve the embedded SPA without caching HTML across binary upgrades.
 async fn serve_index() -> impl IntoResponse {
     let html = include_str!("index.html");
@@ -1024,67 +1183,138 @@ async fn serve_service_worker() -> impl IntoResponse {
 
 // --- Embedded vendored frontend assets ---
 //
-// Every asset is embedded via include_str!/include_bytes! so the compiled
-// binary is completely self-contained and runs offline without reaching out to
-// any CDN. Long cache (1y immutable) since the bytes never change for a given
-// binary build.
+// Every asset is embedded via include_str! so the compiled binary is
+// completely self-contained and runs offline without reaching out to any CDN.
+//
+// These URLs are stable across releases (the contents are not), so they must
+// NOT be served with a long immutable lifetime: a client that cached yesterday's
+// `marked.js` would keep it for a year after an upgrade. Instead each asset gets
+// a content-hash ETag and revalidates, which costs one cheap 304 per asset.
 
-fn text_response(bytes: &'static str, content_type: &'static str) -> Response {
+struct EmbeddedAsset {
+    body: &'static str,
+    content_type: &'static str,
+    etag: std::sync::OnceLock<String>,
+}
+
+impl EmbeddedAsset {
+    const fn new(body: &'static str, content_type: &'static str) -> Self {
+        Self {
+            body,
+            content_type,
+            etag: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn etag(&self) -> &str {
+        self.etag.get_or_init(|| {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(self.body.as_bytes());
+            let mut out = String::with_capacity(66);
+            out.push('"');
+            for byte in digest {
+                out.push_str(&format!("{byte:02x}"));
+            }
+            out.push('"');
+            out
+        })
+    }
+}
+
+static ASSET_JSZIP: EmbeddedAsset = EmbeddedAsset::new(
+    include_str!("vendor/jszip.min.js"),
+    "application/javascript; charset=utf-8",
+);
+static ASSET_FFLATE: EmbeddedAsset = EmbeddedAsset::new(
+    include_str!("vendor/fflate.umd.js"),
+    "application/javascript; charset=utf-8",
+);
+static ASSET_MARKED: EmbeddedAsset = EmbeddedAsset::new(
+    include_str!("vendor/marked.min.js"),
+    "application/javascript; charset=utf-8",
+);
+static ASSET_STREAMSAVER: EmbeddedAsset = EmbeddedAsset::new(
+    include_str!("vendor/streamsaver.min.js"),
+    "application/javascript; charset=utf-8",
+);
+static ASSET_STREAMSAVER_SW: EmbeddedAsset = EmbeddedAsset::new(
+    include_str!("vendor/streamsaver_sw.js"),
+    "application/javascript; charset=utf-8",
+);
+static ASSET_STREAMSAVER_MITM: EmbeddedAsset =
+    EmbeddedAsset::new(include_str!("vendor/mitm.html"), "text/html; charset=utf-8");
+static ASSET_FONTS_CSS: EmbeddedAsset = EmbeddedAsset::new(
+    include_str!("vendor/fonts_inline.css"),
+    "text/css; charset=utf-8",
+);
+
+fn if_none_match_matches(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == etag || candidate.strip_prefix("W/") == Some(etag)
+            })
+        })
+}
+
+fn asset_response(headers: &axum::http::HeaderMap, asset: &'static EmbeddedAsset) -> Response {
+    let etag = asset.etag();
+    if if_none_match_matches(headers, etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(axum::http::header::ETAG, etag)
+            .header(
+                axum::http::header::CACHE_CONTROL,
+                "public, max-age=0, must-revalidate",
+            )
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::NOT_MODIFIED.into_response());
+    }
+
     Response::builder()
         .status(StatusCode::OK)
         .header(
             axum::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
+            "public, max-age=0, must-revalidate",
         )
-        .header(CONTENT_TYPE, content_type)
-        .body(Body::from(bytes))
-        .unwrap()
+        .header(axum::http::header::ETAG, etag)
+        .header(CONTENT_TYPE, asset.content_type)
+        .header(axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(Body::from(asset.body))
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })
 }
 
-async fn serve_asset_streamsaver() -> impl IntoResponse {
-    text_response(
-        include_str!("vendor/streamsaver.min.js"),
-        "application/javascript; charset=utf-8",
-    )
+async fn serve_asset_streamsaver(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    asset_response(&headers, &ASSET_STREAMSAVER)
 }
 
-async fn serve_asset_streamsaver_sw() -> impl IntoResponse {
-    text_response(
-        include_str!("vendor/streamsaver_sw.js"),
-        "application/javascript; charset=utf-8",
-    )
+async fn serve_asset_streamsaver_sw(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    asset_response(&headers, &ASSET_STREAMSAVER_SW)
 }
 
-async fn serve_asset_streamsaver_mitm_html() -> impl IntoResponse {
-    text_response(include_str!("vendor/mitm.html"), "text/html; charset=utf-8")
+async fn serve_asset_streamsaver_mitm_html(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    asset_response(&headers, &ASSET_STREAMSAVER_MITM)
 }
 
-async fn serve_asset_jszip() -> impl IntoResponse {
-    text_response(
-        include_str!("vendor/jszip.min.js"),
-        "application/javascript; charset=utf-8",
-    )
+async fn serve_asset_jszip(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    asset_response(&headers, &ASSET_JSZIP)
 }
 
-async fn serve_asset_fflate() -> impl IntoResponse {
-    text_response(
-        include_str!("vendor/fflate.umd.js"),
-        "application/javascript; charset=utf-8",
-    )
+async fn serve_asset_fflate(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    asset_response(&headers, &ASSET_FFLATE)
 }
 
-async fn serve_asset_fonts_inline_css() -> impl IntoResponse {
-    text_response(
-        include_str!("vendor/fonts_inline.css"),
-        "text/css; charset=utf-8",
-    )
+async fn serve_asset_fonts_inline_css(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    asset_response(&headers, &ASSET_FONTS_CSS)
 }
 
-async fn serve_asset_marked() -> impl IntoResponse {
-    text_response(
-        include_str!("vendor/marked.min.js"),
-        "application/javascript; charset=utf-8",
-    )
+async fn serve_asset_marked(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    asset_response(&headers, &ASSET_MARKED)
 }
 
 const DIRECT_PUT_MAX_BYTES: i64 = 16 * 1024 * 1024;
@@ -1103,6 +1333,19 @@ const THUMBNAIL_MAX_BYTES: i64 = 2 * 1024 * 1024;
 const USER_DATA_MAX_BYTES: usize = 7 * 1024 * 1024;
 const MAX_SESSIONS_PER_ACCOUNT: usize = 100;
 const MAX_PASSKEYS_PER_ACCOUNT: usize = 20;
+/// Per-user objects the application owns. The cleanup sweep must treat every
+/// entry here as protected: anything missing from this list is garbage-collected,
+/// so a new per-user file type has to be added in the same change that writes it.
+const USER_ALLOWED_FILES: &[&str] = &[
+    "passkeys.json",
+    "passkeys_meta.json",
+    "sessions.json",
+    "public_shares.json",
+    "shares.enc",
+    "pfp.enc",
+    "passkey_reg.json",
+    "passkey_auth.json",
+];
 
 fn is_valid_username(username: &str) -> bool {
     (3..=30).contains(&username.len())
@@ -3286,7 +3529,11 @@ async fn perform_cleanup(
         }
     }
 
-    // Full bucket scan for completely foreign files and orphaned user data
+    // Full bucket scan for orphaned user data.
+    //
+    // Only namespaces this application writes to are ever deleted from. The
+    // bucket may be shared with other tooling or hold operator backups, and a
+    // maintenance sweep must never destroy data it did not create.
     if let Ok(all_objects) = storage.list_objects(bucket, None, None).await {
         let mut valid_users = std::collections::HashSet::new();
         for object in &all_objects {
@@ -3302,36 +3549,23 @@ async fn perform_cleanup(
 
         for object in all_objects {
             let key = object.key;
-            if key.starts_with("config/")
-                || key.starts_with("admin/")
-                || key.starts_with("uploads/")
-                || key.starts_with("auth_sessions/")
-                || key.starts_with("passkey_index/")
-            {
+            let owned = key.starts_with("users/") || key.starts_with("shares/");
+            if !owned {
                 continue;
             }
 
             if key.starts_with("users/") {
                 let parts: Vec<&str> = key.split('/').collect();
+                // users/<name>.json - the account record itself.
                 if parts.len() == 2 && key.ends_with(".json") {
                     continue;
-                } else if parts.len() == 3 {
-                    let username = parts[1];
-                    let filename = parts[2];
-                    if valid_users.contains(username) {
-                        let allowed_files = [
-                            "passkeys.json",
-                            "passkeys_meta.json",
-                            "sessions.json",
-                            "public_shares.json",
-                            "pfp.enc",
-                            "passkey_reg.json",
-                            "passkey_auth.json",
-                        ];
-                        if allowed_files.contains(&filename) {
-                            continue;
-                        }
-                    }
+                }
+                // users/<name>/<owned file> for an account that still exists.
+                if parts.len() == 3
+                    && valid_users.contains(parts[1])
+                    && USER_ALLOWED_FILES.contains(&parts[2])
+                {
+                    continue;
                 }
             }
 
@@ -3683,8 +3917,21 @@ fn verify_totp_code(
 
 async fn register_user(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::Json(payload): axum::Json<AuthRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Registration is unauthenticated, so it is the cheapest endpoint to abuse
+    // for account spam; budget it per client address.
+    let registration_key = format!("register:{}", client_ip(&headers));
+    if state
+        .registration_limiter
+        .retry_after(&registration_key)
+        .is_some()
+    {
+        return Err(too_many_attempts());
+    }
+    state.registration_limiter.record_failure(&registration_key);
+
     let username = payload.username.trim();
     if !is_valid_username(username) {
         return Err((
@@ -3754,7 +4001,21 @@ async fn login_user(
     axum::Json(payload): axum::Json<AuthRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let username = payload.username.trim();
+    // Two budgets: one per client address (blunts a single host spraying many
+    // accounts) and one per account (blunts a botnet guessing one password).
+    let ip_key = format!("login:ip:{}", client_ip(&headers));
+    let account_key = format!(
+        "login:user:{}",
+        username.chars().take(64).collect::<String>()
+    );
+    if state.login_ip_limiter.retry_after(&ip_key).is_some()
+        || state.login_limiter.retry_after(&account_key).is_some()
+    {
+        return Err(too_many_attempts());
+    }
+
     if !is_valid_username(username) || !is_valid_auth_key(&payload.auth_key) {
+        state.login_ip_limiter.record_failure(&ip_key);
         return Err((
             StatusCode::UNAUTHORIZED,
             "Invalid username or password".to_string(),
@@ -3763,16 +4024,21 @@ async fn login_user(
     let user_key = format!("users/{}.json", username);
 
     // Retrieve user data from S3
-    let bytes = state
+    let bytes = match state
         .storage
         .get_object_bytes(&state.bucket, &user_key)
         .await
-        .map_err(|_| {
-            (
+    {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            state.login_ip_limiter.record_failure(&ip_key);
+            state.login_limiter.record_failure(&account_key);
+            return Err((
                 StatusCode::UNAUTHORIZED,
                 "Invalid username or password".to_string(),
-            )
-        })?;
+            ));
+        }
+    };
     let user_json: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -3793,6 +4059,8 @@ async fn login_user(
     let computed_hash = format!("{:02x}", hasher.finalize());
 
     if !secure_equal(computed_hash.as_bytes(), stored_hash.as_bytes()) {
+        state.login_ip_limiter.record_failure(&ip_key);
+        state.login_limiter.record_failure(&account_key);
         return Err((
             StatusCode::UNAUTHORIZED,
             "Invalid username or password".to_string(),
@@ -3810,12 +4078,17 @@ async fn login_user(
             .unwrap_or("");
         if let Some(code) = &payload.totp_code {
             if !verify_totp_code(totp_secret, username, code)? {
+                state.login_ip_limiter.record_failure(&ip_key);
+                state.login_limiter.record_failure(&account_key);
                 return Err((StatusCode::FORBIDDEN, "INVALID_2FA".to_string()));
             }
         } else {
             return Err((StatusCode::FORBIDDEN, "2FA_REQUIRED".to_string()));
         }
     }
+
+    // Credentials are valid: forget accumulated failures for this account.
+    state.login_limiter.clear(&account_key);
 
     // Generate token with a unique session id (sessions never expire)
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -3888,14 +4161,27 @@ async fn get_user_shares(
 
     let shares_key = format!("users/{}/shares.enc", username);
 
-    // Fetch from S3
+    // Only a genuinely missing index means "no shares yet". A storage failure
+    // must not be reported as an empty list: the client syncs by writing back
+    // the list it just read, so a transient error would erase every saved share.
     let bytes = state
         .storage
-        .get_object_bytes(&state.bucket, &shares_key)
-        .await;
+        .get_object_bytes_optional(&state.bucket, &shares_key)
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                "Failed to read the encrypted share index for '{}': {}",
+                username,
+                error
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load saved shares; please retry".to_string(),
+            )
+        })?;
 
     match bytes {
-        Ok(bytes) => {
+        Some(bytes) => {
             // Hex encode to send in JSON
             let shares_hex = bytes
                 .iter()
@@ -3903,10 +4189,7 @@ async fn get_user_shares(
                 .collect::<String>();
             Ok(axum::Json(serde_json::json!({ "shares_enc": shares_hex })))
         }
-        Err(_) => {
-            // S3 NoSuchKey means no shares yet
-            Ok(axum::Json(serde_json::json!({ "shares_enc": "" })))
-        }
+        None => Ok(axum::Json(serde_json::json!({ "shares_enc": "" }))),
     }
 }
 
@@ -5077,7 +5360,10 @@ async fn admin_get_user_sessions(
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     verify_admin(&headers, &state).await?;
-
+    let username = username.trim();
+    if !is_valid_username(username) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid username".to_string()));
+    }
     let sessions_key = format!("users/{}/sessions.json", username);
     let sessions: Vec<UserSession> = match state
         .storage
@@ -5111,7 +5397,10 @@ async fn admin_revoke_user_session(
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     verify_admin(&headers, &state).await?;
-
+    let username = username.trim();
+    if !is_valid_username(username) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid username".to_string()));
+    }
     let sessions_key = format!("users/{}/sessions.json", username);
     let mut sessions: Vec<UserSession> = match state
         .storage
@@ -5551,6 +5840,18 @@ mod tests {
             presign_ttl: std::time::Duration::from_secs(60),
             upload_session_max_secs: 3600,
             session_revocations: tokio::sync::broadcast::channel(16).0,
+            login_limiter: std::sync::Arc::new(RateLimiter::new(
+                std::time::Duration::from_secs(60),
+                10,
+            )),
+            login_ip_limiter: std::sync::Arc::new(RateLimiter::new(
+                std::time::Duration::from_secs(60),
+                50,
+            )),
+            registration_limiter: std::sync::Arc::new(RateLimiter::new(
+                std::time::Duration::from_secs(60),
+                10,
+            )),
         };
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         write_active_upload_marker(
@@ -5574,5 +5875,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(marker.status, "finishing");
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_account_data_and_never_deletes_foreign_objects() {
+        let storage = storage::Storage::Memory(std::sync::Arc::new(tokio::sync::Mutex::new(
+            storage::MemoryBackend::default(),
+        )));
+        let seeded = [
+            ("users/alice.json", "{}"),
+            ("users/alice/shares.enc", "encrypted share index"),
+            ("users/alice/sessions.json", "[]"),
+            ("users/alice/passkeys.json", "[]"),
+            ("users/alice/pfp.enc", "sealed avatar"),
+            (
+                "users/alice/stray.bin",
+                "junk that the sweep should collect",
+            ),
+            ("backups/important.tar", "operator data"),
+            ("config/jwt_secret.bin", "signing secret"),
+        ];
+        for (key, body) in seeded {
+            storage
+                .put_object("test", key, body.as_bytes().to_vec(), None)
+                .await
+                .unwrap();
+        }
+
+        perform_cleanup(&storage, "test").await.unwrap();
+
+        for key in [
+            "users/alice.json",
+            "users/alice/shares.enc",
+            "users/alice/sessions.json",
+            "users/alice/passkeys.json",
+            "users/alice/pfp.enc",
+            "backups/important.tar",
+            "config/jwt_secret.bin",
+        ] {
+            assert!(
+                storage
+                    .get_object_bytes_optional("test", key)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "cleanup must not delete {key}"
+            );
+        }
+        assert!(
+            storage
+                .get_object_bytes_optional("test", "users/alice/stray.bin")
+                .await
+                .unwrap()
+                .is_none(),
+            "cleanup should collect unknown files inside an owned namespace"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_blocks_after_budget_and_clears_on_success() {
+        let limiter = RateLimiter::new(std::time::Duration::from_secs(60), 3);
+        assert!(limiter.retry_after("k").is_none());
+        for _ in 0..3 {
+            limiter.record_failure("k");
+        }
+        let wait = limiter.retry_after("k");
+        assert!(wait.is_some());
+        assert!(wait.unwrap() >= 1);
+        assert!(limiter.retry_after("unrelated").is_none());
+        limiter.clear("k");
+        assert!(limiter.retry_after("k").is_none());
     }
 }
