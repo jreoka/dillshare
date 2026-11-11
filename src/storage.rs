@@ -3,12 +3,144 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+pub const ENCRYPTED_STORAGE_MAGIC: &[u8] = b"DSENC1\0";
+const NONCE_LEN: usize = 12;
+
 #[derive(Clone)]
-pub enum Storage {
+pub struct StorageCipher {
+    cipher: Aes256Gcm,
+}
+
+impl StorageCipher {
+    pub fn new(key: &[u8; 32]) -> Self {
+        Self {
+            cipher: Aes256Gcm::new(key.into()),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn from_slice(key_bytes: &[u8]) -> Result<Self, String> {
+        if key_bytes.len() != 32 {
+            return Err("Storage encryption key must be exactly 32 bytes".to_string());
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(key_bytes);
+        Ok(Self::new(&key))
+    }
+
+    /// Derive a 32-byte key from secret bytes using HMAC-SHA256
+    pub fn derive_from_secret(secret: &[u8]) -> Self {
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(b"dillshare-storage-encryption-v1")
+            .expect("HMAC can take key of any size");
+        mac.update(secret);
+        let result = mac.finalize().into_bytes();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&result);
+        Self::new(&key)
+    }
+
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        use rand::Rng;
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = self
+            .cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|e| format!("Storage encryption failed: {e}"))?;
+
+        let mut out = Vec::with_capacity(ENCRYPTED_STORAGE_MAGIC.len() + NONCE_LEN + ciphertext.len());
+        out.extend_from_slice(ENCRYPTED_STORAGE_MAGIC);
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        if !data.starts_with(ENCRYPTED_STORAGE_MAGIC) {
+            // Unencrypted / legacy plaintext - transparent backward compatibility
+            return Ok(data.to_vec());
+        }
+        if data.len() < ENCRYPTED_STORAGE_MAGIC.len() + NONCE_LEN + 16 {
+            return Err("Corrupted encrypted storage payload: too short".to_string());
+        }
+        let nonce_start = ENCRYPTED_STORAGE_MAGIC.len();
+        let nonce_end = nonce_start + NONCE_LEN;
+        let nonce = Nonce::from_slice(&data[nonce_start..nonce_end]);
+        let ciphertext = &data[nonce_end..];
+        self.cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| format!("Storage decryption failed (invalid key or corrupted data): {e}"))
+    }
+}
+
+pub fn should_encrypt_key(key: &str) -> bool {
+    key != "config/jwt_secret.bin"
+}
+
+#[derive(Clone)]
+pub enum StorageBackend {
     S3(aws_sdk_s3::Client),
     Memory(Arc<Mutex<MemoryBackend>>),
+}
+
+#[derive(Clone)]
+pub struct Storage {
+    pub backend: StorageBackend,
+    pub cipher: Option<Arc<StorageCipher>>,
+    pub sse_algorithm: Option<String>,
+    pub sse_kms_key_id: Option<String>,
+}
+
+#[allow(non_snake_case)]
+impl Storage {
+    pub fn S3(client: aws_sdk_s3::Client) -> Self {
+        Self {
+            backend: StorageBackend::S3(client),
+            cipher: None,
+            sse_algorithm: None,
+            sse_kms_key_id: None,
+        }
+    }
+
+    pub fn Memory(mem: Arc<Mutex<MemoryBackend>>) -> Self {
+        Self {
+            backend: StorageBackend::Memory(mem),
+            cipher: None,
+            sse_algorithm: None,
+            sse_kms_key_id: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_cipher(mut self, cipher: StorageCipher) -> Self {
+        self.cipher = Some(Arc::new(cipher));
+        self
+    }
+
+    pub fn set_cipher(&mut self, cipher: StorageCipher) {
+        self.cipher = Some(Arc::new(cipher));
+    }
+
+    #[allow(dead_code)]
+    pub fn with_sse(mut self, sse_algorithm: Option<String>, sse_kms_key_id: Option<String>) -> Self {
+        self.sse_algorithm = sse_algorithm;
+        self.sse_kms_key_id = sse_kms_key_id;
+        self
+    }
+
+    pub fn set_sse(&mut self, sse_algorithm: Option<String>, sse_kms_key_id: Option<String>) {
+        self.sse_algorithm = sse_algorithm;
+        self.sse_kms_key_id = sse_kms_key_id;
+    }
 }
 
 #[derive(Default)]
@@ -83,7 +215,7 @@ fn memory_etag(data: &[u8]) -> String {
 
 impl Storage {
     pub fn supports_presigning(&self) -> bool {
-        matches!(self, Storage::S3(_))
+        matches!(self.backend, StorageBackend::S3(_))
     }
 
     fn collect_presigned_request(
@@ -110,19 +242,32 @@ impl Storage {
         checksum_sha256: &str,
         expires_in: Duration,
     ) -> Result<PresignedRequest, String> {
-        let Storage::S3(client) = self else {
+        let StorageBackend::S3(client) = &self.backend else {
             return Err("Direct transfers require S3 storage".to_string());
         };
         let config = aws_sdk_s3::presigning::PresigningConfig::expires_in(expires_in)
             .map_err(|e| e.to_string())?;
-        let request = client
+        let mut builder = client
             .put_object()
             .bucket(bucket)
             .key(key)
             .content_length(content_length)
             .content_type("application/octet-stream")
             .checksum_sha256(checksum_sha256)
-            .if_none_match("*")
+            .if_none_match("*");
+
+        if let Some(ref sse) = self.sse_algorithm {
+            if sse.eq_ignore_ascii_case("AES256") {
+                builder = builder.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256);
+            } else if sse.eq_ignore_ascii_case("aws:kms") {
+                builder = builder.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms);
+                if let Some(ref kms_id) = self.sse_kms_key_id {
+                    builder = builder.ssekms_key_id(kms_id);
+                }
+            }
+        }
+
+        let request = builder
             .presigned(config)
             .await
             .map_err(|e| e.to_string())?;
@@ -134,7 +279,7 @@ impl Storage {
         request: UploadPartRequest<'_>,
         expires_in: Duration,
     ) -> Result<PresignedRequest, String> {
-        let Storage::S3(client) = self else {
+        let StorageBackend::S3(client) = &self.backend else {
             return Err("Direct transfers require S3 storage".to_string());
         };
         let config = aws_sdk_s3::presigning::PresigningConfig::expires_in(expires_in)
@@ -162,7 +307,7 @@ impl Storage {
         key: &str,
         expires_in: Duration,
     ) -> Result<PresignedRequest, String> {
-        let Storage::S3(client) = self else {
+        let StorageBackend::S3(client) = &self.backend else {
             return Err("Direct transfers require S3 storage".to_string());
         };
         let config = aws_sdk_s3::presigning::PresigningConfig::expires_in(expires_in)
@@ -178,8 +323,8 @@ impl Storage {
     }
 
     pub async fn get_object_bytes(&self, bucket: &str, key: &str) -> Result<Vec<u8>, String> {
-        match self {
-            Storage::S3(client) => {
+        let raw = match &self.backend {
+            StorageBackend::S3(client) => {
                 let res = client
                     .get_object()
                     .bucket(bucket)
@@ -193,16 +338,23 @@ impl Storage {
                     .await
                     .map_err(|e| e.to_string())?
                     .into_bytes();
-                Ok(bytes.to_vec())
+                bytes.to_vec()
             }
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let m = mem.lock().await;
                 m.files
                     .get(key)
                     .cloned()
-                    .ok_or_else(|| "Not found".to_string())
+                    .ok_or_else(|| "Not found".to_string())?
+            }
+        };
+
+        if should_encrypt_key(key) {
+            if let Some(ref cipher) = self.cipher {
+                return cipher.decrypt(&raw);
             }
         }
+        Ok(raw)
     }
 
     /// Fetch an object, distinguishing "does not exist" from a real storage
@@ -214,8 +366,8 @@ impl Storage {
         bucket: &str,
         key: &str,
     ) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            Storage::S3(client) => match client.get_object().bucket(bucket).key(key).send().await {
+        let maybe_raw = match &self.backend {
+            StorageBackend::S3(client) => match client.get_object().bucket(bucket).key(key).send().await {
                 Ok(response) => {
                     let bytes = response
                         .body
@@ -224,7 +376,7 @@ impl Storage {
                         .map_err(|e| e.to_string())?
                         .into_bytes()
                         .to_vec();
-                    Ok(Some(bytes))
+                    Some(bytes)
                 }
                 Err(error) => {
                     use aws_smithy_types::error::metadata::ProvideErrorMetadata;
@@ -234,13 +386,25 @@ impl Storage {
                             return Ok(None);
                         }
                     }
-                    Err(error.to_string())
+                    return Err(error.to_string());
                 }
             },
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let m = mem.lock().await;
-                Ok(m.files.get(key).cloned())
+                m.files.get(key).cloned()
             }
+        };
+
+        match maybe_raw {
+            Some(raw) => {
+                if should_encrypt_key(key) {
+                    if let Some(ref cipher) = self.cipher {
+                        return cipher.decrypt(&raw).map(Some);
+                    }
+                }
+                Ok(Some(raw))
+            }
+            None => Ok(None),
         }
     }
 
@@ -249,8 +413,8 @@ impl Storage {
         bucket: &str,
         key: &str,
     ) -> Result<Option<(Vec<u8>, String)>, String> {
-        match self {
-            Storage::S3(client) => {
+        let maybe_raw = match &self.backend {
+            StorageBackend::S3(client) => {
                 let response = match client.get_object().bucket(bucket).key(key).send().await {
                     Ok(response) => response,
                     Err(error) => {
@@ -275,15 +439,28 @@ impl Storage {
                     .map_err(|e| e.to_string())?
                     .into_bytes()
                     .to_vec();
-                Ok(Some((bytes, e_tag)))
+                Some((bytes, e_tag))
             }
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let m = mem.lock().await;
-                Ok(m.files.get(key).cloned().map(|bytes| {
+                m.files.get(key).cloned().map(|bytes| {
                     let e_tag = memory_etag(&bytes);
                     (bytes, e_tag)
-                }))
+                })
             }
+        };
+
+        match maybe_raw {
+            Some((raw, etag)) => {
+                if should_encrypt_key(key) {
+                    if let Some(ref cipher) = self.cipher {
+                        let decrypted = cipher.decrypt(&raw)?;
+                        return Ok(Some((decrypted, etag)));
+                    }
+                }
+                Ok(Some((raw, etag)))
+            }
+            None => Ok(None),
         }
     }
 
@@ -294,22 +471,42 @@ impl Storage {
         data: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<(), String> {
-        match self {
-            Storage::S3(client) => {
+        let payload = if should_encrypt_key(key) {
+            if let Some(ref cipher) = self.cipher {
+                cipher.encrypt(&data)?
+            } else {
+                data
+            }
+        } else {
+            data
+        };
+
+        match &self.backend {
+            StorageBackend::S3(client) => {
                 let mut req = client
                     .put_object()
                     .bucket(bucket)
                     .key(key)
-                    .body(aws_sdk_s3::primitives::ByteStream::from(data));
+                    .body(aws_sdk_s3::primitives::ByteStream::from(payload));
                 if let Some(ct) = content_type {
                     req = req.content_type(ct);
+                }
+                if let Some(ref sse) = self.sse_algorithm {
+                    if sse.eq_ignore_ascii_case("AES256") {
+                        req = req.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256);
+                    } else if sse.eq_ignore_ascii_case("aws:kms") {
+                        req = req.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms);
+                        if let Some(ref kms_id) = self.sse_kms_key_id {
+                            req = req.ssekms_key_id(kms_id);
+                        }
+                    }
                 }
                 req.send().await.map_err(|e| e.to_string())?;
                 Ok(())
             }
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let mut m = mem.lock().await;
-                m.files.insert(key.to_string(), data);
+                m.files.insert(key.to_string(), payload);
                 m.last_modified.insert(key.to_string(), now_secs());
                 if let Some(ct) = content_type {
                     m.content_types.insert(key.to_string(), ct.to_string());
@@ -326,8 +523,8 @@ impl Storage {
         bucket: &str,
         key: &str,
     ) -> Result<Option<HeadObjectInfo>, String> {
-        match self {
-            Storage::S3(client) => {
+        match &self.backend {
+            StorageBackend::S3(client) => {
                 match client.head_object().bucket(bucket).key(key).send().await {
                     Ok(output) => Ok(Some(HeadObjectInfo {
                         size: output.content_length().unwrap_or(0),
@@ -346,7 +543,7 @@ impl Storage {
                     }
                 }
             }
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let m = mem.lock().await;
                 Ok(m.files.get(key).map(|data| HeadObjectInfo {
                     size: data.len() as i64,
@@ -364,16 +561,36 @@ impl Storage {
         data: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<bool, String> {
-        match self {
-            Storage::S3(client) => {
+        let payload = if should_encrypt_key(key) {
+            if let Some(ref cipher) = self.cipher {
+                cipher.encrypt(&data)?
+            } else {
+                data
+            }
+        } else {
+            data
+        };
+
+        match &self.backend {
+            StorageBackend::S3(client) => {
                 let mut request = client
                     .put_object()
                     .bucket(bucket)
                     .key(key)
                     .if_none_match("*")
-                    .body(aws_sdk_s3::primitives::ByteStream::from(data));
+                    .body(aws_sdk_s3::primitives::ByteStream::from(payload));
                 if let Some(content_type) = content_type {
                     request = request.content_type(content_type);
+                }
+                if let Some(ref sse) = self.sse_algorithm {
+                    if sse.eq_ignore_ascii_case("AES256") {
+                        request = request.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256);
+                    } else if sse.eq_ignore_ascii_case("aws:kms") {
+                        request = request.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms);
+                        if let Some(ref kms_id) = self.sse_kms_key_id {
+                            request = request.ssekms_key_id(kms_id);
+                        }
+                    }
                 }
                 match request.send().await {
                     Ok(_) => Ok(true),
@@ -392,12 +609,12 @@ impl Storage {
                     }
                 }
             }
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let mut m = mem.lock().await;
                 if m.files.contains_key(key) {
                     return Ok(false);
                 }
-                m.files.insert(key.to_string(), data);
+                m.files.insert(key.to_string(), payload);
                 m.last_modified.insert(key.to_string(), now_secs());
                 if let Some(content_type) = content_type {
                     m.content_types
@@ -418,16 +635,36 @@ impl Storage {
         content_type: Option<&str>,
         e_tag: &str,
     ) -> Result<bool, String> {
-        match self {
-            Storage::S3(client) => {
+        let payload = if should_encrypt_key(key) {
+            if let Some(ref cipher) = self.cipher {
+                cipher.encrypt(&data)?
+            } else {
+                data
+            }
+        } else {
+            data
+        };
+
+        match &self.backend {
+            StorageBackend::S3(client) => {
                 let mut request = client
                     .put_object()
                     .bucket(bucket)
                     .key(key)
                     .if_match(e_tag)
-                    .body(aws_sdk_s3::primitives::ByteStream::from(data));
+                    .body(aws_sdk_s3::primitives::ByteStream::from(payload));
                 if let Some(content_type) = content_type {
                     request = request.content_type(content_type);
+                }
+                if let Some(ref sse) = self.sse_algorithm {
+                    if sse.eq_ignore_ascii_case("AES256") {
+                        request = request.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256);
+                    } else if sse.eq_ignore_ascii_case("aws:kms") {
+                        request = request.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms);
+                        if let Some(ref kms_id) = self.sse_kms_key_id {
+                            request = request.ssekms_key_id(kms_id);
+                        }
+                    }
                 }
                 match request.send().await {
                     Ok(_) => Ok(true),
@@ -446,7 +683,7 @@ impl Storage {
                     }
                 }
             }
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let mut m = mem.lock().await;
                 let Some(current) = m.files.get(key) else {
                     return Ok(false);
@@ -454,7 +691,7 @@ impl Storage {
                 if memory_etag(current) != e_tag {
                     return Ok(false);
                 }
-                m.files.insert(key.to_string(), data);
+                m.files.insert(key.to_string(), payload);
                 m.last_modified.insert(key.to_string(), now_secs());
                 if let Some(content_type) = content_type {
                     m.content_types
@@ -468,8 +705,8 @@ impl Storage {
     }
 
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), String> {
-        match self {
-            Storage::S3(client) => {
+        match &self.backend {
+            StorageBackend::S3(client) => {
                 client
                     .delete_object()
                     .bucket(bucket)
@@ -479,7 +716,7 @@ impl Storage {
                     .map_err(|e| e.to_string())?;
                 Ok(())
             }
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let mut m = mem.lock().await;
                 m.files.remove(key);
                 m.content_types.remove(key);
@@ -495,8 +732,8 @@ impl Storage {
         if keys.is_empty() {
             return Ok(());
         }
-        match self {
-            Storage::S3(client) => {
+        match &self.backend {
+            StorageBackend::S3(client) => {
                 for chunk in keys.chunks(1000) {
                     let mut objects = Vec::new();
                     for k in chunk {
@@ -526,7 +763,7 @@ impl Storage {
                 }
                 Ok(())
             }
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let mut m = mem.lock().await;
                 for k in keys {
                     m.files.remove(k);
@@ -548,8 +785,8 @@ impl Storage {
         if limit == Some(0) {
             return Ok(Vec::new());
         }
-        match self {
-            Storage::S3(client) => {
+        match &self.backend {
+            StorageBackend::S3(client) => {
                 let mut req = client.list_objects_v2().bucket(bucket);
                 if let Some(p) = prefix {
                     req = req.prefix(p);
@@ -582,7 +819,7 @@ impl Storage {
                 }
                 Ok(keys)
             }
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let m = mem.lock().await;
                 let mut keys: Vec<_> = m
                     .files
@@ -613,12 +850,22 @@ impl Storage {
         key: &str,
         content_type: Option<&str>,
     ) -> Result<String, String> {
-        match self {
-            Storage::S3(client) => {
+        match &self.backend {
+            StorageBackend::S3(client) => {
                 let mut req = client.create_multipart_upload().bucket(bucket).key(key);
                 req = req.checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256);
                 if let Some(ct) = content_type {
                     req = req.content_type(ct);
+                }
+                if let Some(ref sse) = self.sse_algorithm {
+                    if sse.eq_ignore_ascii_case("AES256") {
+                        req = req.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256);
+                    } else if sse.eq_ignore_ascii_case("aws:kms") {
+                        req = req.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms);
+                        if let Some(ref kms_id) = self.sse_kms_key_id {
+                            req = req.ssekms_key_id(kms_id);
+                        }
+                    }
                 }
                 let res = req.send().await.map_err(|e| e.to_string())?;
                 res.upload_id()
@@ -626,7 +873,7 @@ impl Storage {
                     .map(str::to_string)
                     .ok_or_else(|| "S3 returned no multipart upload ID".to_string())
             }
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let mut m = mem.lock().await;
                 let upload_id = uuid::Uuid::new_v4().to_string();
                 m.multipart_uploads
@@ -647,8 +894,8 @@ impl Storage {
         upload_id: &str,
         parts: Vec<CompletedPart>,
     ) -> Result<(), String> {
-        match self {
-            Storage::S3(client) => {
+        match &self.backend {
+            StorageBackend::S3(client) => {
                 let mut builder = aws_sdk_s3::types::CompletedMultipartUpload::builder();
                 for p in parts {
                     let mut part_builder = aws_sdk_s3::types::CompletedPart::builder()
@@ -671,7 +918,7 @@ impl Storage {
                     .map_err(|e| e.to_string())?;
                 Ok(())
             }
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let mut m = mem.lock().await;
                 m.multipart_upload_keys.remove(upload_id);
                 if let Some(upload) = m.multipart_uploads.remove(upload_id) {
@@ -698,8 +945,8 @@ impl Storage {
         key: &str,
         upload_id: &str,
     ) -> Result<(), String> {
-        match self {
-            Storage::S3(client) => {
+        match &self.backend {
+            StorageBackend::S3(client) => {
                 client
                     .abort_multipart_upload()
                     .bucket(bucket)
@@ -710,7 +957,7 @@ impl Storage {
                     .map_err(|e| e.to_string())?;
                 Ok(())
             }
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let mut m = mem.lock().await;
                 m.multipart_uploads.remove(upload_id);
                 m.multipart_upload_keys.remove(upload_id);
@@ -725,8 +972,8 @@ impl Storage {
         &self,
         bucket: &str,
     ) -> Result<Vec<MultipartUploadInfo>, String> {
-        match self {
-            Storage::S3(client) => {
+        match &self.backend {
+            StorageBackend::S3(client) => {
                 let mut out = Vec::new();
                 let mut key_marker: Option<String> = None;
                 let mut upload_id_marker: Option<String> = None;
@@ -762,7 +1009,7 @@ impl Storage {
                 }
                 Ok(out)
             }
-            Storage::Memory(mem) => {
+            StorageBackend::Memory(mem) => {
                 let m = mem.lock().await;
                 Ok(m.multipart_uploads
                     .keys()

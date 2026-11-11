@@ -21,6 +21,7 @@ hmac = "0.12.1"
 totp-rs = { version = "5.5", features = ["qr", "gen_secret"] }
 rand = "0.10.2"
 base64 = "0.22.1"
+aes-gcm = "0.10.3"
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
 aws-smithy-types = "1.6.1"
 

@@ -53,6 +53,9 @@ mode is for UI work and tests only — restarting the process loses everything.
 | `URL` | — | Public origin. When set, requests with a different `Host`/`Origin` are rejected (defence in depth against DNS rebinding) and CORS is restricted to it. `/healthz` is exempt so in-cluster probes keep working. |
 | `RP_ID` / `RP_ORIGIN` | `localhost` / `http://localhost:3000` | WebAuthn relying party; must match the public origin for passkeys. |
 | `JWT_SECRET` | generated | ≥32 bytes. If unset, a random secret is created atomically in the bucket at `config/jwt_secret.bin`. |
+| `STORAGE_ENCRYPTION_KEY` | derived from `JWT_SECRET` | ≥32 bytes or 64-char hex. Dedicated AES-256-GCM key for encrypting all server-managed JSON files and metadata in S3. |
+| `AWS_S3_SERVER_SIDE_ENCRYPTION` | — | Set `AES256` or `aws:kms` to enforce S3 server-side encryption headers on all direct transfers and API writes. |
+| `AWS_S3_SSE_KMS_KEY_ID` | — | Optional KMS Key ARN/ID when using `AWS_S3_SERVER_SIDE_ENCRYPTION=aws:kms`. |
 | `DILLSHARE_PRESIGN_TTL_SECONDS` | `300` | Clamped to 60–900. Applies to every presigned URL. |
 | `DILLSHARE_PARTIAL_TIMEOUT_HOURS` | `12` | Hard lifetime of an unfinished upload session (1–168). |
 
@@ -84,6 +87,12 @@ harmless as a backstop.
 
 ## Security model
 
+- **Zero plaintext in S3.** File bytes and filenames (`metadata.enc`) are encrypted
+  in the browser before upload with per-share AES-256-GCM keys. All server-managed
+  objects in S3 (user profiles, passkeys, sessions, share manifests, ownership
+  records) are encrypted with an application-level AES-256-GCM cipher (`STORAGE_ENCRYPTION_KEY`).
+  To an external observer with direct bucket read access, 100% of the S3 objects are
+  opaque ciphertext.
 - Share keys never leave the browser except to the destination bucket inside the
   encrypted stream; possession of the full link is what grants access.
 - The account encryption key is derived from the password (PBKDF2-SHA-256,

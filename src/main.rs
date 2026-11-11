@@ -232,7 +232,7 @@ async fn main() {
         }
     }
 
-    let storage = if configured_bucket.is_some() {
+    let mut storage = if configured_bucket.is_some() {
         let s3_client = aws_sdk_s3::Client::from_conf(s3_config_builder.build());
         storage::Storage::S3(s3_client)
     } else {
@@ -244,6 +244,14 @@ async fn main() {
         )))
     };
 
+    // Configure optional bucket-level Server-Side Encryption (e.g., AES256 or aws:kms)
+    let sse_algo = std::env::var("AWS_S3_SERVER_SIDE_ENCRYPTION").ok();
+    let sse_kms_key = std::env::var("AWS_S3_SSE_KMS_KEY_ID").ok();
+    if let Some(ref algo) = sse_algo {
+        tracing::info!("Enforcing S3 server-side encryption with algorithm '{}'", algo);
+        storage.set_sse(Some(algo.clone()), sse_kms_key);
+    }
+
     if storage.supports_presigning() {
         tracing::info!("Validating S3 connection to bucket '{}'...", bucket);
         match storage.list_objects(&bucket, None, Some(1)).await {
@@ -254,10 +262,6 @@ async fn main() {
         }
     }
 
-    initialize_admin_roles(&storage, &bucket)
-        .await
-        .unwrap_or_else(|error| panic!("Failed to initialize account roles: {error}"));
-
     // Get JWT secret from environment or load/generate in S3
     let jwt_secret = match std::env::var("JWT_SECRET") {
         Ok(secret_str) if secret_str.len() >= 32 => secret_str.into_bytes(),
@@ -266,6 +270,35 @@ async fn main() {
             .await
             .unwrap_or_else(|error| panic!("Failed to load or persist JWT secret: {error}")),
     };
+
+    // Configure application-level encryption for all server-managed JSON and metadata objects in S3
+    let storage_cipher = if let Ok(key_str) = std::env::var("STORAGE_ENCRYPTION_KEY") {
+        if key_str.len() == 64 && key_str.chars().all(|c| c.is_ascii_hexdigit()) {
+            let mut key = [0u8; 32];
+            for (i, chunk) in key_str.as_bytes().chunks_exact(2).enumerate() {
+                let byte_str = std::str::from_utf8(chunk).unwrap();
+                key[i] = u8::from_str_radix(byte_str, 16).expect("valid hex");
+            }
+            tracing::info!("Application-level storage encryption enabled with dedicated 256-bit key.");
+            storage::StorageCipher::new(&key)
+        } else if key_str.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(key_str.as_bytes());
+            tracing::info!("Application-level storage encryption enabled with dedicated key.");
+            storage::StorageCipher::new(&key)
+        } else {
+            tracing::info!("Deriving 256-bit application-level storage encryption key from passphrase.");
+            storage::StorageCipher::derive_from_secret(key_str.as_bytes())
+        }
+    } else {
+        tracing::info!("Deriving 256-bit application-level storage encryption key from JWT secret.");
+        storage::StorageCipher::derive_from_secret(&jwt_secret)
+    };
+    storage.set_cipher(storage_cipher);
+
+    initialize_admin_roles(&storage, &bucket)
+        .await
+        .unwrap_or_else(|error| panic!("Failed to initialize account roles: {error}"));
 
     let rp_id = std::env::var("RP_ID").unwrap_or_else(|_| "localhost".to_string());
     let origin_str =
@@ -6207,5 +6240,75 @@ mod tests {
         assert!(limiter.retry_after("unrelated").is_none());
         limiter.clear("k");
         assert!(limiter.retry_after("k").is_none());
+    }
+
+    #[tokio::test]
+    async fn storage_cipher_encrypts_and_transparently_decrypts_objects() {
+        let cipher = storage::StorageCipher::derive_from_secret(b"test-secret-key-12345");
+        let plaintext = b"{\"username\":\"alice\",\"role\":\"admin\"}";
+
+        // Direct cipher test
+        let encrypted = cipher.encrypt(plaintext).unwrap();
+        assert!(encrypted.starts_with(storage::ENCRYPTED_STORAGE_MAGIC));
+        assert_ne!(&encrypted[..], plaintext);
+
+        let decrypted = cipher.decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+
+        // Backward compatibility test: unencrypted data passes through unchanged
+        let legacy = b"{\"legacy\":\"plaintext\"}";
+        let legacy_decrypted = cipher.decrypt(legacy).unwrap();
+        assert_eq!(legacy_decrypted, legacy);
+
+        // Memory storage test with cipher
+        let mem_backend = std::sync::Arc::new(tokio::sync::Mutex::new(storage::MemoryBackend::default()));
+        let storage = storage::Storage::Memory(mem_backend.clone()).with_cipher(cipher);
+
+        // Writing users/alice.json should store encrypted ciphertext in the underlying storage
+        storage
+            .put_object("test", "users/alice.json", plaintext.to_vec(), Some("application/json"))
+            .await
+            .unwrap();
+
+        let raw_in_backend = mem_backend.lock().await.files.get("users/alice.json").cloned().unwrap();
+        assert!(raw_in_backend.starts_with(storage::ENCRYPTED_STORAGE_MAGIC));
+        assert_ne!(&raw_in_backend[..], plaintext);
+
+        // Reading through storage should transparently decrypt
+        let read_back = storage.get_object_bytes("test", "users/alice.json").await.unwrap();
+        assert_eq!(read_back, plaintext);
+
+        // Conditional write with ETag works with encrypted storage
+        let (read_etag_bytes, etag) = storage
+            .get_object_bytes_with_etag("test", "users/alice.json")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_etag_bytes, plaintext);
+
+        let updated_plaintext = b"{\"username\":\"alice\",\"role\":\"superadmin\"}";
+        let update_ok = storage
+            .put_object_if_match(
+                "test",
+                "users/alice.json",
+                updated_plaintext.to_vec(),
+                Some("application/json"),
+                &etag,
+            )
+            .await
+            .unwrap();
+        assert!(update_ok);
+
+        let final_read = storage.get_object_bytes("test", "users/alice.json").await.unwrap();
+        assert_eq!(final_read, updated_plaintext);
+
+        // config/jwt_secret.bin is exempted from cipher encryption (remains raw bootstrap seed)
+        let jwt_secret_raw = vec![42u8; 32];
+        storage
+            .put_object("test", "config/jwt_secret.bin", jwt_secret_raw.clone(), None)
+            .await
+            .unwrap();
+        let raw_jwt_in_backend = mem_backend.lock().await.files.get("config/jwt_secret.bin").cloned().unwrap();
+        assert_eq!(raw_jwt_in_backend, jwt_secret_raw);
     }
 }
