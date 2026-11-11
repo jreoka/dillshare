@@ -4607,7 +4607,7 @@ async fn admin_get_stats(
 
     for username in users_list {
         let public_shares_key = format!("users/{}/public_shares.json", username);
-        let mut shares = match state
+        let shares = match state
             .storage
             .get_object_bytes(&state.bucket, &public_shares_key)
             .await
