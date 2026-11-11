@@ -428,6 +428,7 @@ async fn main() {
         .route("/api/user/2fa", delete(disable_2fa))
         // Admin routes (authorized by the signed-in account role)
         .route("/api/admin/stats", get(admin_get_stats))
+        .route("/api/admin/cleanup", post(admin_trigger_cleanup))
         .route("/api/admin/share/:uuid", delete(admin_delete_share))
         .route("/api/admin/user/:username", delete(admin_delete_user))
         .route("/api/admin/user/:username/role", put(admin_set_user_role))
@@ -2234,6 +2235,8 @@ async fn upload_finish(
         let created_at = chrono::DateTime::<chrono::Utc>::from_timestamp(manifest.created_at, 0)
             .unwrap_or_else(chrono::Utc::now)
             .to_rfc3339();
+        let expires_at = chrono::DateTime::<chrono::Utc>::from_timestamp(manifest.expires_at, 0)
+            .map(|dt| dt.to_rfc3339());
         upsert_public_share(
             &state,
             &username,
@@ -2242,7 +2245,8 @@ async fn upload_finish(
                 "files_count": files_count,
                 "total_size": manifest.plaintext_size,
                 "stored_size": manifest.stored_size,
-                "created_at": created_at
+                "created_at": created_at,
+                "expires_at": expires_at
             }),
         )
         .await?;
@@ -2396,6 +2400,8 @@ async fn upload_finish(
     let created_at = chrono::DateTime::<chrono::Utc>::from_timestamp(marker.created_at, 0)
         .unwrap_or_else(chrono::Utc::now)
         .to_rfc3339();
+    let expires_at_str = chrono::DateTime::<chrono::Utc>::from_timestamp(expires_at, 0)
+        .map(|dt| dt.to_rfc3339());
     upsert_public_share(
         &state,
         &username,
@@ -2404,7 +2410,8 @@ async fn upload_finish(
             "files_count": payload.files_count,
             "total_size": payload.total_size,
             "stored_size": stored_size,
-            "created_at": created_at
+            "created_at": created_at,
+            "expires_at": expires_at_str
         }),
     )
     .await?;
@@ -3062,6 +3069,16 @@ async fn get_share(
         })?;
     let now = chrono::Utc::now().timestamp();
     if manifest.expires_at <= now || !manifest.files.contains_key("metadata.enc") {
+        let cleanup_storage = state.storage.clone();
+        let cleanup_bucket = state.bucket.clone();
+        let cleanup_uuid = uuid.clone();
+        let cleanup_owner = manifest.owner.clone();
+        tokio::spawn(async move {
+            let _ = delete_share_objects(&cleanup_storage, &cleanup_bucket, &cleanup_uuid).await;
+            if !cleanup_owner.is_empty() {
+                remove_share_from_user_index(&cleanup_storage, &cleanup_bucket, &cleanup_owner, &cleanup_uuid).await;
+            }
+        });
         return Err((
             StatusCode::NOT_FOUND,
             "Share not found or expired".to_string(),
@@ -4590,7 +4607,7 @@ async fn admin_get_stats(
 
     for username in users_list {
         let public_shares_key = format!("users/{}/public_shares.json", username);
-        let shares = match state
+        let mut shares = match state
             .storage
             .get_object_bytes(&state.bucket, &public_shares_key)
             .await
@@ -4600,6 +4617,71 @@ async fn admin_get_stats(
             }
             Err(_) => Vec::new(),
         };
+
+        let now = chrono::Utc::now().timestamp();
+        let mut active_shares = Vec::new();
+
+        for mut share in shares {
+            let mut is_expired = false;
+            let uuid_opt = share
+                .get("uuid")
+                .and_then(|u| u.as_str())
+                .map(|s| s.to_string());
+
+            let expires_timestamp = if let Some(exp_val) =
+                share.get("expires_at").and_then(|v| v.as_str())
+            {
+                chrono::DateTime::parse_from_rfc3339(exp_val)
+                    .ok()
+                    .map(|dt| dt.timestamp())
+            } else if let Some(ref uuid) = uuid_opt {
+                if let Ok(Some(manifest)) = load_finalized_manifest(&state, uuid).await {
+                    let expires_at_str = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                        manifest.expires_at,
+                        0,
+                    )
+                    .map(|dt| dt.to_rfc3339());
+                    if let Some(obj) = share.as_object_mut() {
+                        obj.insert(
+                            "expires_at".to_string(),
+                            serde_json::json!(expires_at_str),
+                        );
+                    }
+                    Some(manifest.expires_at)
+                } else {
+                    is_expired = true;
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(exp_ts) = expires_timestamp {
+                if exp_ts <= now {
+                    is_expired = true;
+                }
+            }
+
+            if is_expired {
+                if let Some(uuid) = uuid_opt {
+                    let cleanup_storage = state.storage.clone();
+                    let cleanup_bucket = state.bucket.clone();
+                    let cleanup_username = username.clone();
+                    tokio::spawn(async move {
+                        let _ = delete_share_objects(&cleanup_storage, &cleanup_bucket, &uuid).await;
+                        remove_share_from_user_index(
+                            &cleanup_storage,
+                            &cleanup_bucket,
+                            &cleanup_username,
+                            &uuid,
+                        )
+                        .await;
+                    });
+                }
+            } else {
+                active_shares.push(share);
+            }
+        }
 
         let user_key = format!("users/{}.json", username);
         let totp_enabled = match state
@@ -4615,7 +4697,7 @@ async fn admin_get_stats(
             Err(_) => false,
         };
 
-        let total_size: i64 = shares
+        let total_size: i64 = active_shares
             .iter()
             .map(|s| {
                 s.get("stored_size")
@@ -4629,7 +4711,7 @@ async fn admin_get_stats(
             "role": roles.role_for(&username).as_str(),
             "username": username,
             "total_size": total_size,
-            "shares": shares,
+            "shares": active_shares,
             "has_2fa": totp_enabled
         }));
     }
@@ -4644,6 +4726,21 @@ async fn admin_get_stats(
         "current_role": identity.role.as_str(),
         "users": stats
     })))
+}
+
+async fn admin_trigger_cleanup(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    verify_admin(&headers, &state).await?;
+    let storage = state.storage.clone();
+    let bucket = state.bucket.clone();
+    tokio::spawn(async move {
+        if let Err(e) = perform_cleanup(&storage, &bucket).await {
+            tracing::error!("Error during admin-triggered cleanup: {:?}", e);
+        }
+    });
+    Ok(axum::Json(serde_json::json!({ "status": "cleanup_started" })))
 }
 
 async fn admin_delete_share(

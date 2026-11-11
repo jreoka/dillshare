@@ -1347,7 +1347,10 @@
                         <h2 style="font-size: 1.5rem; margin-bottom: 0.25rem;">Admin Panel</h2>
                         <p class="file-meta">Manage users and space allocation</p>
                     </div>
-                    <button class="btn btn-secondary" id="btn-refresh-admin" style="display: none;">Refresh Stats</button>
+                    <div style="display: flex; gap: 0.5rem; align-items: center;">
+                        <button class="btn btn-secondary" id="btn-purge-expired" style="display: none;">Purge Expired Shares</button>
+                        <button class="btn btn-secondary" id="btn-refresh-admin" style="display: none;">Refresh Stats</button>
+                    </div>
                 </div>
 
                 <div id="admin-token-required" class="empty-state" style="display: none; max-width: 400px; margin: 2rem auto;">
@@ -1756,6 +1759,7 @@
         const uploadBoxAuthPrompt = document.getElementById('upload-box-auth-prompt');
         const btnAuthPromptSignin = document.getElementById('btn-auth-prompt-signin');
         const btnRefreshAdmin = document.getElementById('btn-refresh-admin');
+        const btnPurgeExpired = document.getElementById('btn-purge-expired');
 
         const dropZone = document.getElementById('drop-zone');
         const fileSelect = document.getElementById('file-select');
@@ -6413,6 +6417,33 @@
 
         btnRefreshAdmin.addEventListener('click', loadAdminStats);
 
+        if (btnPurgeExpired) {
+            btnPurgeExpired.addEventListener('click', async () => {
+                const token = localStorage.getItem('dill_session_token');
+                if (!token) return;
+                btnPurgeExpired.disabled = true;
+                const origText = btnPurgeExpired.textContent;
+                btnPurgeExpired.textContent = 'Purging...';
+                try {
+                    const res = await fetch('/api/admin/cleanup', {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bearer ${token}` }
+                    });
+                    if (res.ok) {
+                        showToast('Cleanup initiated: Expired shares and stale uploads are being purged from bucket', 'success');
+                        await loadAdminStats();
+                    } else {
+                        showToast('Failed to trigger cleanup: ' + await res.text(), 'error');
+                    }
+                } catch (err) {
+                    showToast('Network error during purge', 'error');
+                } finally {
+                    btnPurgeExpired.disabled = false;
+                    btnPurgeExpired.textContent = origText;
+                }
+            });
+        }
+
         async function loadAdminStats() {
             const token = localStorage.getItem('dill_session_token');
             const dashboard = document.getElementById('admin-dashboard');
@@ -6425,6 +6456,7 @@
                 tokenReq.style.display = 'block';
                 if (adminLoading) adminLoading.style.display = 'none';
                 if (btnRefreshAdmin) btnRefreshAdmin.style.display = 'none';
+                if (btnPurgeExpired) btnPurgeExpired.style.display = 'none';
                 return;
             }
 
@@ -6433,6 +6465,7 @@
             tokenReq.style.display = 'none';
             if (adminLoading) adminLoading.style.display = 'block';
             if (btnRefreshAdmin) btnRefreshAdmin.style.display = 'none';
+            if (btnPurgeExpired) btnPurgeExpired.style.display = 'none';
             usersBody.innerHTML = '';
 
             try {
@@ -6446,6 +6479,7 @@
                         if (adminLoading) adminLoading.style.display = 'none';
                         tokenReq.style.display = 'block';
                         if (btnRefreshAdmin) btnRefreshAdmin.style.display = 'none';
+                        if (btnPurgeExpired) btnPurgeExpired.style.display = 'none';
                         setAdminRoleUi('user');
                         return;
                     }
@@ -6462,6 +6496,7 @@
                 dashboard.style.display = 'block';
                 tokenReq.style.display = 'none';
                 if (btnRefreshAdmin) btnRefreshAdmin.style.display = 'inline-flex';
+                if (btnPurgeExpired) btnPurgeExpired.style.display = 'inline-flex';
 
                 usersBody.innerHTML = '';
 
@@ -6518,27 +6553,55 @@
                             <table style="width:100%; border:1px solid var(--surface-border); background:rgba(0,0,0,0.1); border-radius:4px; margin-top:0.5rem;">
                                 <thead>
                                     <tr>
-                                        <th style="padding:0.5rem; font-size:0.75rem; width:40%;">Share UUID</th>
+                                        <th style="padding:0.5rem; font-size:0.75rem; width:35%;">Share UUID</th>
                                         <th style="padding:0.5rem; font-size:0.75rem;">Files Count</th>
                                         <th style="padding:0.5rem; font-size:0.75rem;">Total Size</th>
                                         <th style="padding:0.5rem; font-size:0.75rem;">Created</th>
+                                        <th style="padding:0.5rem; font-size:0.75rem;">Expires In</th>
                                         <th style="padding:0.5rem; font-size:0.75rem; text-align:right;">Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    ${u.shares.map(s => `
+                                    ${u.shares.map(s => {
+                                        let expBadgeHTML = '';
+                                        if (!s.expires_at) {
+                                            expBadgeHTML = `<span class="badge" style="color:var(--text-muted);">Unknown</span>`;
+                                        } else {
+                                            const expiresAt = new Date(s.expires_at);
+                                            const now = new Date();
+                                            const diffTime = expiresAt - now;
+                                            let expStr = 'Expired';
+                                            if (diffTime > 0) {
+                                                const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+                                                const diffHrs = Math.floor((diffTime % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+                                                if (diffDays > 0) {
+                                                    expStr = `${diffDays}d ${diffHrs}h`;
+                                                } else if (diffHrs > 0) {
+                                                    const diffMins = Math.floor((diffTime % (1000 * 60 * 60)) / (1000 * 60));
+                                                    expStr = `${diffHrs}h ${diffMins}m`;
+                                                } else {
+                                                    const diffMins = Math.floor(diffTime / (1000 * 60));
+                                                    expStr = `${Math.max(1, diffMins)}m`;
+                                                }
+                                            }
+                                            const fullDate = isNaN(expiresAt.getTime()) ? '' : expiresAt.toLocaleString();
+                                            expBadgeHTML = `<span class="badge ${diffTime > 0 ? 'success' : ''}" title="${escapeHtml(fullDate)}">${escapeHtml(expStr)}</span>`;
+                                        }
+                                        return `
                                         <tr>
                                             <td style="padding:0.5rem; font-size:0.75rem; font-family:monospace; color:var(--text-muted);">${escapeHtml(s.uuid)}</td>
                                             <td style="padding:0.5rem; font-size:0.75rem;">${escapeHtml(s.files_count)}</td>
                                             <td style="padding:0.5rem; font-size:0.75rem;">${formatBytes(s.total_size)}</td>
                                             <td style="padding:0.5rem; font-size:0.75rem;">${new Date(s.created_at).toLocaleDateString()}</td>
+                                            <td style="padding:0.5rem; font-size:0.75rem;">${expBadgeHTML}</td>
                                             <td style="padding:0.5rem; font-size:0.75rem; text-align:right;">
                                                 <button class="action-btn delete delete-share-btn" data-uuid="${escapeHtml(s.uuid)}" style="padding: 0.2rem 0.4rem; font-size:0.7rem; font-weight:600; display:inline-flex;">
                                                     Delete
                                                 </button>
                                             </td>
                                         </tr>
-                                    `).join('')}
+                                    `;
+                                    }).join('')}
                                 </tbody>
                             </table>
                         `;
