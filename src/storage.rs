@@ -51,7 +51,7 @@ pub struct PresignedRequest {
 pub struct CompletedPart {
     pub e_tag: String,
     pub part_number: i32,
-    pub checksum_sha256: String,
+    pub checksum_sha256: Option<String>,
 }
 
 pub struct UploadPartRequest<'a> {
@@ -60,7 +60,7 @@ pub struct UploadPartRequest<'a> {
     pub upload_id: &'a str,
     pub part_number: i32,
     pub content_length: i64,
-    pub checksum_sha256: &'a str,
+    pub checksum_sha256: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,14 +139,17 @@ impl Storage {
         };
         let config = aws_sdk_s3::presigning::PresigningConfig::expires_in(expires_in)
             .map_err(|e| e.to_string())?;
-        let request = client
+        let mut builder = client
             .upload_part()
             .bucket(request.bucket)
             .key(request.key)
             .upload_id(request.upload_id)
             .part_number(request.part_number)
-            .content_length(request.content_length)
-            .checksum_sha256(request.checksum_sha256)
+            .content_length(request.content_length);
+        if let Some(checksum) = request.checksum_sha256 {
+            builder = builder.checksum_sha256(checksum);
+        }
+        let request = builder
             .presigned(config)
             .await
             .map_err(|e| e.to_string())?;
@@ -648,13 +651,13 @@ impl Storage {
             Storage::S3(client) => {
                 let mut builder = aws_sdk_s3::types::CompletedMultipartUpload::builder();
                 for p in parts {
-                    builder = builder.parts(
-                        aws_sdk_s3::types::CompletedPart::builder()
-                            .part_number(p.part_number)
-                            .e_tag(p.e_tag)
-                            .checksum_sha256(p.checksum_sha256)
-                            .build(),
-                    );
+                    let mut part_builder = aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(p.part_number)
+                        .e_tag(p.e_tag);
+                    if let Some(cs) = p.checksum_sha256 {
+                        part_builder = part_builder.checksum_sha256(cs);
+                    }
+                    builder = builder.parts(part_builder.build());
                 }
                 client
                     .complete_multipart_upload()

@@ -2659,7 +2659,8 @@ struct MultipartPartUrlReq {
     part_number: i32,
     file_name: String,
     content_length: i64,
-    checksum_sha256: String,
+    #[serde(default)]
+    checksum_sha256: Option<String>,
 }
 
 async fn upload_multipart_part_url(
@@ -2689,13 +2690,19 @@ async fn upload_multipart_part_url(
             "Part number must be between 1 and 10000".to_string(),
         ));
     }
-    if !(1..=S3_PART_MAX_BYTES).contains(&payload.content_length)
-        || !is_valid_sha256_checksum(&payload.checksum_sha256)
-    {
+    if !(1..=S3_PART_MAX_BYTES).contains(&payload.content_length) {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             "Multipart part size is outside S3 limits".to_string(),
         ));
+    }
+    if let Some(ref cs) = payload.checksum_sha256 {
+        if !is_valid_sha256_checksum(cs) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Invalid SHA-256 checksum".to_string(),
+            ));
+        }
     }
     if payload.upload_id.is_empty()
         || payload.upload_id.len() > 1024
@@ -2753,7 +2760,7 @@ async fn upload_multipart_part_url(
                 upload_id: &payload.upload_id,
                 part_number: payload.part_number,
                 content_length: payload.content_length,
-                checksum_sha256: &payload.checksum_sha256,
+                checksum_sha256: None,
             },
             state.presign_ttl,
         )
@@ -2777,7 +2784,8 @@ async fn upload_multipart_part_url(
 struct CompletedPartReq {
     part_number: i32,
     e_tag: String,
-    checksum_sha256: String,
+    #[serde(default)]
+    checksum_sha256: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2875,12 +2883,19 @@ async fn upload_multipart_complete(
         if part.e_tag.is_empty()
             || part.e_tag.len() > 256
             || part.e_tag.chars().any(char::is_control)
-            || !is_valid_sha256_checksum(&part.checksum_sha256)
         {
             return Err((
                 StatusCode::BAD_REQUEST,
                 "Invalid multipart ETag".to_string(),
             ));
+        }
+        if let Some(ref cs) = part.checksum_sha256 {
+            if !is_valid_sha256_checksum(cs) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Invalid multipart checksum".to_string(),
+                ));
+            }
         }
     }
 
@@ -2923,7 +2938,7 @@ async fn upload_multipart_complete(
         let completed_part = crate::storage::CompletedPart {
             part_number: p.part_number,
             e_tag: p.e_tag,
-            checksum_sha256: p.checksum_sha256,
+            checksum_sha256: None,
         };
         completed_parts.push(completed_part);
     }
