@@ -1247,7 +1247,7 @@
                             <label for="expiry-days-input" style="font-size: 0.85rem; font-weight: 600; color: var(--text-main);">Expiration</label>
                             <span id="expiry-resolved-hint" style="font-size: 0.75rem; color: var(--text-muted);">1 to 3650 days (e.g. 7, 30d, 1y)</span>
                         </div>
-                        <input type="text" id="expiry-days-input" autocomplete="off" placeholder="e.g. 7, 30d, 1y" value="7d" style="width: 100%; box-sizing: border-box; font-family: inherit; background: var(--surface-color); border: 1px solid var(--surface-border); border-radius: 6px; padding: 0.6rem 0.75rem; color: var(--text-main); font-size: 0.85rem; outline: none;">
+                        <input type="text" id="expiry-days-input" autocomplete="off" placeholder="e.g. 7, 30d, 1y" style="width: 100%; box-sizing: border-box; font-family: inherit; background: var(--surface-color); border: 1px solid var(--surface-border); border-radius: 6px; padding: 0.6rem 0.75rem; color: var(--text-main); font-size: 0.85rem; outline: none;">
                     </div>
                     <div>
                     <div style="display: flex; justify-content: space-between; font-size: 0.85rem; font-weight: 600; color: var(--text-main); margin-bottom: 0.35rem;">
@@ -3463,13 +3463,15 @@
         }
         if (expiryDaysInput) {
             expiryDaysInput.addEventListener('input', updateExpiryHint);
+            expiryDaysInput.addEventListener('change', updateExpiryHint);
+            window.addEventListener('pageshow', updateExpiryHint);
             updateExpiryHint();
         }
 
         btnClearFiles.addEventListener('click', () => {
             selectedFiles = [];
             if (expiryDaysInput) {
-                expiryDaysInput.value = '7d';
+                expiryDaysInput.value = '';
                 updateExpiryHint();
             }
             if (shareMsgInput) {
@@ -4113,7 +4115,7 @@
                     dropZone.style.opacity = '1';
                     selectedFiles = [];
                     if (expiryDaysInput) {
-                        expiryDaysInput.value = '7d';
+                        expiryDaysInput.value = '';
                         updateExpiryHint();
                     }
                     if (shareMsgInput) {
@@ -4165,7 +4167,7 @@
             shareResultCard.style.display = 'none';
             selectedFiles = [];
             if (expiryDaysInput) {
-                expiryDaysInput.value = '7d';
+                expiryDaysInput.value = '';
                 updateExpiryHint();
             }
             updateSelectedFilesUI();
@@ -5913,7 +5915,7 @@
             const shareMsgInput = document.getElementById('share-message-input');
             const msgCharCount = document.getElementById('message-char-count');
             if (expiryDaysInput) {
-                expiryDaysInput.value = '7d';
+                expiryDaysInput.value = '';
                 if (typeof updateExpiryHint === 'function') updateExpiryHint();
             }
             if (shareMsgInput) {
