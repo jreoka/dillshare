@@ -1483,10 +1483,35 @@ fn expiration_timestamp(start_timestamp: i64, expiry_days: i64) -> Option<i64> {
 const MAX_EXPIRY_DAYS: i64 = 3650;
 
 fn parse_expiry_days(value: &str, start_timestamp: i64) -> Option<i64> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    let days = value.parse::<i64>().ok()?;
+
+    let num_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    if num_end == 0 {
+        return None;
+    }
+
+    let num_str = &trimmed[..num_end];
+    let unit_str = trimmed[num_end..].trim().to_ascii_lowercase();
+
+    let num = num_str.parse::<i64>().ok()?;
+    if num == 0 {
+        return None;
+    }
+
+    let multiplier: i64 = match unit_str.as_str() {
+        "" | "d" | "day" | "days" => 1,
+        "w" | "week" | "weeks" => 7,
+        "m" | "mo" | "month" | "months" => 30,
+        "y" | "yr" | "year" | "years" => 365,
+        _ => return None,
+    };
+
+    let days = num.checked_mul(multiplier)?;
     if days == 0 || days > MAX_EXPIRY_DAYS {
         return None;
     }
@@ -5933,6 +5958,13 @@ mod tests {
         assert_eq!(parse_expiry_days("1.5", start), None);
         assert_eq!(parse_expiry_days("", start), None);
         assert_eq!(parse_expiry_days(&i64::MAX.to_string(), start), None);
+        assert_eq!(parse_expiry_days("30d", start), Some(30));
+        assert_eq!(parse_expiry_days("2w", start), Some(14));
+        assert_eq!(parse_expiry_days("1m", start), Some(30));
+        assert_eq!(parse_expiry_days("1y", start), Some(365));
+        assert_eq!(parse_expiry_days("10y", start), Some(3650));
+        assert_eq!(parse_expiry_days("11y", start), None);
+        assert_eq!(parse_expiry_days("1y 30d", start), None);
     }
 
     #[test]
