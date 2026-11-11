@@ -214,17 +214,31 @@ self.addEventListener('fetch', (event) => {
 });
 
 function handleDownloadStream(streamPath) {
-    const entry = downloadStreams.get(streamPath);
+    let entry = downloadStreams.get(streamPath);
+    let matchedKey = streamPath;
+    if (!entry) {
+        // Fallback: match by the streamId segment (/sw-download/<streamId>)
+        const parts = streamPath.split('/');
+        if (parts.length >= 3 && parts[1] === 'sw-download') {
+            const idPath = `/sw-download/${parts[2]}`;
+            if (downloadStreams.has(idPath)) {
+                entry = downloadStreams.get(idPath);
+                matchedKey = idPath;
+            }
+        }
+    }
     if (!entry) {
         return new Response('Download stream not found or expired', { status: 404 });
     }
-    downloadStreams.delete(streamPath);
+    downloadStreams.delete(matchedKey);
     clearTimeout(entry.expiryTimer);
-    const filename = entry.filename;
-    const encodedFilename = encodeURIComponent(filename).replace(/['()]/g, escape).replace(/\*/g, '%2A');
+    const filename = entry.filename || 'download';
+    const sanitized = filename.replace(/[\r\n]/g, '').trim();
+    const asciiFallback = sanitized.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_') || 'download';
+    const encodedFilename = encodeURIComponent(sanitized).replace(/['()]/g, escape).replace(/\*/g, '%2A');
     const headers = new Headers({
         'Content-Type': entry.contentType || 'application/octet-stream',
-        'Content-Disposition': `attachment; filename="${encodedFilename}"; filename*=UTF-8''${encodedFilename}`,
+        'Content-Disposition': `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodedFilename}`,
         'Cache-Control': 'no-cache, no-store'
     });
     if (Number.isSafeInteger(entry.size) && entry.size >= 0) {

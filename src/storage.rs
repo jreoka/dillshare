@@ -16,6 +16,8 @@ pub struct MemoryBackend {
     pub files: HashMap<String, Vec<u8>>,
     pub content_types: HashMap<String, String>,
     pub multipart_uploads: HashMap<String, HashMap<i32, Vec<u8>>>,
+    /// Maps upload_id to object key
+    pub multipart_upload_keys: HashMap<String, String>,
     /// Last modification time (unix seconds) per object key. Kept so that
     /// share expiry, upload_time reporting and cleanup work in memory mode.
     pub last_modified: HashMap<String, i64>,
@@ -626,6 +628,8 @@ impl Storage {
                 let upload_id = uuid::Uuid::new_v4().to_string();
                 m.multipart_uploads
                     .insert(upload_id.clone(), HashMap::new());
+                m.multipart_upload_keys
+                    .insert(upload_id.clone(), key.to_string());
                 m.multipart_upload_times
                     .insert(upload_id.clone(), now_secs());
                 Ok(upload_id)
@@ -666,6 +670,7 @@ impl Storage {
             }
             Storage::Memory(mem) => {
                 let mut m = mem.lock().await;
+                m.multipart_upload_keys.remove(upload_id);
                 if let Some(upload) = m.multipart_uploads.remove(upload_id) {
                     let mut data = Vec::new();
                     let mut sorted_parts: Vec<_> = upload.into_iter().collect();
@@ -705,6 +710,7 @@ impl Storage {
             Storage::Memory(mem) => {
                 let mut m = mem.lock().await;
                 m.multipart_uploads.remove(upload_id);
+                m.multipart_upload_keys.remove(upload_id);
                 m.multipart_upload_times.remove(upload_id);
                 Ok(())
             }
@@ -758,7 +764,11 @@ impl Storage {
                 Ok(m.multipart_uploads
                     .keys()
                     .map(|id| MultipartUploadInfo {
-                        key: String::new(),
+                        key: m
+                            .multipart_upload_keys
+                            .get(id)
+                            .cloned()
+                            .unwrap_or_default(),
                         upload_id: id.clone(),
                         initiated_secs: m
                             .multipart_upload_times

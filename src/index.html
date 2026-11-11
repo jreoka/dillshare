@@ -2674,7 +2674,7 @@
                     return null;
                 }
                 const streamId = Date.now() + '_' + Math.random().toString(36).substring(2);
-                const streamPath = `/sw-download/${streamId}/${encodeURIComponent(filename)}`;
+                const streamPath = `/sw-download/${streamId}`;
                 const channel = new MessageChannel();
 
                 return await new Promise((resolve) => {
@@ -3168,14 +3168,15 @@
                         return `<${type}${startAtt} class="md-list">\n${body}</${type}>\n`;
                     },
                     blockquote(token) {
-                        return `<blockquote class="md-quote">\n${this.parser.parse(token.tokens)}</blockquote>\n`;
+                        const content = token.tokens ? this.parser.parse(token.tokens) : escapeHtml(token.text || '');
+                        return `<blockquote class="md-quote">\n${content}</blockquote>\n`;
                     },
                     hr() {
                         return `<hr class="md-hr">\n`;
                     },
                     link(token) {
                         const href = safeMarkdownHref(token.href);
-                        const text = this.parser.parseInline(token.tokens);
+                        const text = token.tokens ? this.parser.parseInline(token.tokens) : escapeHtml(token.text || '');
                         if (!href) return text;
                         let out = `<a href="${escapeHtml(href)}" class="md-link" target="_blank" rel="noopener noreferrer"`;
                         if (token.title) out += ` title="${escapeHtml(token.title)}"`;
@@ -5002,7 +5003,9 @@
                 };
 
                 // --- Acquire a streaming disk sink for the ZIP output. ---
-                let sink = await createSWWriteStream(zipFileName, totalPlainSize > 0 ? totalPlainSize : undefined, 'application/zip');
+                // Omit Content-Length: the dynamic ZIP stream size includes headers and compression,
+                // so totalPlainSize would trigger net::ERR_CONTENT_LENGTH_MISMATCH.
+                let sink = await createSWWriteStream(zipFileName, undefined, 'application/zip');
 
                 if (!sink && typeof streamSaver !== 'undefined' && !isSafariOrIOS()) {
                     try {
@@ -6409,19 +6412,19 @@
                         <td>${u.has_2fa ? '<span style="color:var(--success)">Yes</span>' : '<span style="color:var(--text-muted)">No</span>'}</td>
                         <td>
                             <div class="share-actions">
-                                <button class="action-btn toggle-shares-btn" data-username="${u.username}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600; color:var(--primary);">
+                                <button class="action-btn toggle-shares-btn" data-username="${escapeHtml(u.username)}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600; color:var(--primary);">
                                     View Shares
                                 </button>
-                                <button class="action-btn toggle-sessions-btn" data-username="${u.username}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600; color:var(--primary);">
+                                <button class="action-btn toggle-sessions-btn" data-username="${escapeHtml(u.username)}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600; color:var(--primary);">
                                     View Sessions
                                 </button>
                                 ${canManageRoles && u.role !== 'superadmin' ? `
-                                    <button class="action-btn change-role-btn" data-username="${u.username}" data-role="${u.role}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600; color:var(--primary);">
+                                    <button class="action-btn change-role-btn" data-username="${escapeHtml(u.username)}" data-role="${escapeHtml(u.role)}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600; color:var(--primary);">
                                         ${u.role === 'admin' ? 'Demote' : 'Promote to Admin'}
                                     </button>
                                 ` : ''}
                                 ${u.role !== 'superadmin' && (u.role !== 'admin' || canManageRoles) ? `
-                                    <button class="action-btn delete delete-user-btn" data-username="${u.username}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600;">
+                                    <button class="action-btn delete delete-user-btn" data-username="${escapeHtml(u.username)}" style="padding: 0.35rem 0.6rem; font-size:0.75rem; font-weight:600;">
                                         Delete User
                                     </button>
                                 ` : ''}
@@ -6576,7 +6579,7 @@
                                                     <td style="padding:0.5rem; font-size:0.75rem; font-family:monospace;">${escapeHtml(s.ip)}</td>
                                                     <td style="padding:0.5rem; font-size:0.75rem;">${new Date(s.created_at * 1000).toLocaleString()}</td>
                                                     <td style="padding:0.5rem; font-size:0.75rem; text-align:right;">
-                                                        <button class="action-btn delete admin-revoke-user-session-btn" data-username="${username}" data-session-id="${escapeHtml(s.id)}" style="padding: 0.2rem 0.4rem; font-size:0.7rem; font-weight:600; display:inline-flex;">
+                                                        <button class="action-btn delete admin-revoke-user-session-btn" data-username="${escapeHtml(username)}" data-session-id="${escapeHtml(s.id)}" style="padding: 0.2rem 0.4rem; font-size:0.7rem; font-weight:600; display:inline-flex;">
                                                             Revoke
                                                         </button>
                                                     </td>
