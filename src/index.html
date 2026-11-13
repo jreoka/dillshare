@@ -1740,12 +1740,6 @@
         let currentFolderPath = []; // For navigating folder tree in share viewer
 
         // DOM elements
-        const viewUpload = document.getElementById('view-upload');
-        const viewShares = document.getElementById('view-shares');
-        const viewShareDetails = document.getElementById('view-share-details');
-        const viewAdmin = document.getElementById('view-admin');
-        const viewProfile = document.getElementById('view-profile');
-        const viewSessions = document.getElementById('view-sessions');
         const navUpload = document.getElementById('nav-upload');
         const navShares = document.getElementById('nav-shares');
         const navSessions = document.getElementById('nav-sessions');
@@ -1753,10 +1747,6 @@
         const navAdmin = document.getElementById('nav-admin');
         const logoLink = document.getElementById('logo-link');
 
-        const uploadBoxTitle = document.getElementById('upload-box-title');
-        const uploadBoxDesc = document.getElementById('upload-box-desc');
-        const uploadBoxBtnGroup = document.getElementById('upload-box-btn-group');
-        const uploadBoxAuthPrompt = document.getElementById('upload-box-auth-prompt');
         const btnAuthPromptSignin = document.getElementById('btn-auth-prompt-signin');
         const btnRefreshAdmin = document.getElementById('btn-refresh-admin');
         const btnPurgeExpired = document.getElementById('btn-purge-expired');
@@ -2115,30 +2105,52 @@
 
         async function generateVideoThumbnail(file) {
             const url = URL.createObjectURL(file);
+            const video = document.createElement('video');
             try {
-                const video = document.createElement('video');
                 video.muted = true;
                 video.preload = 'metadata';
                 video.src = url;
                 await new Promise((resolve, reject) => {
-                    video.onloadeddata = resolve;
-                    video.onerror = reject;
+                    let timer = null;
+                    const cleanup = () => {
+                        clearTimeout(timer);
+                        video.removeEventListener('loadeddata', onLoaded);
+                        video.removeEventListener('error', onErr);
+                    };
+                    const onLoaded = () => { cleanup(); resolve(); };
+                    const onErr = (err) => { cleanup(); reject(err); };
+                    timer = setTimeout(() => { cleanup(); reject(new Error('Video load timeout')); }, 5000);
+                    video.addEventListener('loadeddata', onLoaded);
+                    video.addEventListener('error', onErr);
                 });
                 // Seek to ~1s (or 10% of duration) to land on a non-black frame.
-                const t = video.duration && isFinite(video.duration)
+                const t = video.duration && isFinite(video.duration) && video.duration > 0
                     ? Math.min(1, video.duration * 0.1)
-                    : 0.1;
-                await new Promise((resolve) => {
-                    const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
-                    video.addEventListener('seeked', onSeeked);
-                    video.currentTime = t;
-                });
+                    : 0;
+                if (t > 0 && Math.abs(video.currentTime - t) > 0.001) {
+                    await new Promise((resolve, reject) => {
+                        let timer = null;
+                        const cleanup = () => {
+                            clearTimeout(timer);
+                            video.removeEventListener('seeked', onSeeked);
+                            video.removeEventListener('error', onErr);
+                        };
+                        const onSeeked = () => { cleanup(); resolve(); };
+                        const onErr = (err) => { cleanup(); reject(err); };
+                        timer = setTimeout(() => { cleanup(); resolve(); }, 3000);
+                        video.addEventListener('seeked', onSeeked);
+                        video.addEventListener('error', onErr);
+                        video.currentTime = t;
+                    });
+                }
                 const canvas = drawScaledToCanvas(video);
                 if (!canvas) return null;
                 return await canvasToJpegArrayBuffer(canvas);
             } catch (_) {
                 return null;
             } finally {
+                video.removeAttribute('src');
+                try { video.load(); } catch (_) {}
                 URL.revokeObjectURL(url);
             }
         }
@@ -2378,12 +2390,15 @@
                     resolvers[i] = res;
                     rejecters[i] = rej;
                 });
+                decryptPromises[i].catch(() => {});
             }
 
+            let consumerAborted = false;
             (async () => {
                 let rem = totalPlaintextSize;
                 try {
                     for (let idx = 0; idx < totalChunks; idx++) {
+                        if (consumerAborted) break;
                         const thisPlain = Math.min(chunkSize, rem);
                         const thisCtLen = thisPlain + 16;
                         const need = 12 + thisCtLen;
@@ -2410,43 +2425,61 @@
             })();
 
             let remYield = totalPlaintextSize;
-            for (let idx = 0; idx < totalChunks; idx++) {
-                const thisPlain = Math.min(chunkSize, remYield);
-                const pt = await decryptPromises[idx];
-                // Release the reference immediately: the promise array would
-                // otherwise pin every decrypted chunk for the whole download.
-                decryptPromises[idx] = null;
-                yield pt;
-                remYield -= thisPlain;
-                bytesDecrypted += thisPlain;
-                if (onProgress) onProgress({ bytesReceived, bytesDecrypted, totalBytes: totalPlaintextSize });
+            try {
+                for (let idx = 0; idx < totalChunks; idx++) {
+                    const thisPlain = Math.min(chunkSize, remYield);
+                    const pt = await decryptPromises[idx];
+                    // Release the reference immediately: the promise array would
+                    // otherwise pin every decrypted chunk for the whole download.
+                    decryptPromises[idx] = null;
+                    yield pt;
+                    remYield -= thisPlain;
+                    bytesDecrypted += thisPlain;
+                    if (onProgress) onProgress({ bytesReceived, bytesDecrypted, totalBytes: totalPlaintextSize });
+                }
+            } finally {
+                consumerAborted = true;
             }
         }
 
         const directDownloadUrlCache = new Map();
+        const directDownloadUrlInFlight = new Map();
 
         async function resolveDirectDownloadUrl(url, forceRefresh = false) {
             const parsed = new URL(url, window.location.origin);
             if (parsed.origin !== window.location.origin || !parsed.pathname.includes('/file/')) {
                 return url;
             }
-            if (forceRefresh) directDownloadUrlCache.delete(parsed.pathname);
-            const cached = directDownloadUrlCache.get(parsed.pathname);
-            if (cached && cached.expiresAt > Date.now()) return cached.url;
-
-            const signingPath = parsed.pathname.replace('/file/', '/file-url/');
-            const response = await fetch(signingPath, { cache: 'no-store' });
-            if (!response.ok) throw new Error(await response.text() || `Download authorization failed (${response.status})`);
-            const signed = await response.json();
-            if (!signed.url || !Number.isFinite(signed.expires_in)) {
-                throw new Error('Server returned an invalid direct-download URL');
+            const cacheKey = parsed.pathname;
+            if (!forceRefresh) {
+                const cached = directDownloadUrlCache.get(cacheKey);
+                if (cached && cached.expiresAt > Date.now()) return cached.url;
+            } else if (!directDownloadUrlInFlight.has(cacheKey)) {
+                directDownloadUrlCache.delete(cacheKey);
             }
-            const cacheSeconds = Math.max(1, signed.expires_in - 15);
-            directDownloadUrlCache.set(parsed.pathname, {
-                url: signed.url,
-                expiresAt: Date.now() + cacheSeconds * 1000
-            });
-            return signed.url;
+
+            let inFlight = directDownloadUrlInFlight.get(cacheKey);
+            if (!inFlight) {
+                const signingPath = parsed.pathname.replace('/file/', '/file-url/');
+                inFlight = (async () => {
+                    const response = await fetch(signingPath, { cache: 'no-store' });
+                    if (!response.ok) throw new Error(await response.text() || `Download authorization failed (${response.status})`);
+                    const signed = await response.json();
+                    if (!signed.url || !Number.isFinite(signed.expires_in)) {
+                        throw new Error('Server returned an invalid direct-download URL');
+                    }
+                    const cacheSeconds = Math.max(1, signed.expires_in - 15);
+                    directDownloadUrlCache.set(cacheKey, {
+                        url: signed.url,
+                        expiresAt: Date.now() + cacheSeconds * 1000
+                    });
+                    return signed.url;
+                })().finally(() => {
+                    directDownloadUrlInFlight.delete(cacheKey);
+                });
+                directDownloadUrlInFlight.set(cacheKey, inFlight);
+            }
+            return await inFlight;
         }
 
         // High-performance Parallel HTTP Range downloader + Web Worker pool decryptor
@@ -2472,6 +2505,7 @@
                         resolvers[i] = res;
                         rejecters[i] = rej;
                     });
+                    promises[i].catch(() => {});
                 }
 
                 const NETWORK_CONCURRENCY = Math.max(6, Math.min(16, (navigator.hardwareConcurrency || 4) * 2));
@@ -2584,7 +2618,14 @@
                 return;
             }
 
-            const reader = (typeof target === 'string') ? (await fetch(target, { signal }).then(r => r.body.getReader())) : target;
+            let reader;
+            if (typeof target === 'string') {
+                const res = await fetch(target, { signal });
+                if (!res.ok || !res.body) throw new Error(`File retrieval failed (${res.status})`);
+                reader = res.body.getReader();
+            } else {
+                reader = target;
+            }
             yield* streamDecryptChunked(reader, key, totalPlaintextSize, onProgress);
         }
 
@@ -3034,9 +3075,8 @@
 
                 const onKeyDown = (e) => {
                     if (e.key === 'Escape') {
+                        e.preventDefault();
                         onCancel();
-                    } else if (e.key === 'Enter') {
-                        onOk();
                     }
                 };
 
@@ -3047,7 +3087,7 @@
                 document.addEventListener('keydown', onKeyDown);
 
                 openAppModal(modal);
-                setTimeout(() => okBtn.focus(), 50);
+                setTimeout(() => (isDanger ? cancelBtn : okBtn).focus(), 50);
             });
         }
 
@@ -3490,8 +3530,8 @@
         let activeUploadPingInterval = null;
         let isUploadCancelled = false;
 
-        function abortActiveUpload() {
-            isUploadCancelled = true;
+        function abortActiveUpload(markCancelled = true) {
+            if (markCancelled) isUploadCancelled = true;
             if (activeUploadPingInterval) {
                 clearInterval(activeUploadPingInterval);
                 activeUploadPingInterval = null;
@@ -4047,6 +4087,7 @@
                         activeFileWorkers.push(fileWorker());
                     }
                     await Promise.all(activeFileWorkers);
+                    if (isUploadCancelled) throw new Error('Upload cancelled');
 
                     meta.files = metaFiles;
 
@@ -4135,7 +4176,7 @@
                     activeUploadPingInterval = null;
                 }
                 if (activeUploadUuid) {
-                    abortActiveUpload();
+                    abortActiveUpload(false);
                 }
                 uploadProgressCard.style.display = 'none';
                 dropZone.style.pointerEvents = 'auto';
@@ -4439,6 +4480,19 @@
 
         async function loadShareDetails(uuid) {
             try {
+                if (countdownInterval) {
+                    clearInterval(countdownInterval);
+                    countdownInterval = null;
+                }
+                const resetShareMsgCard = document.getElementById('share-message-card');
+                const resetShareMsgText = document.getElementById('share-message-text');
+                const resetOwnerBadge = document.getElementById('share-owner-badge');
+                if (resetShareMsgCard) resetShareMsgCard.style.display = 'none';
+                if (resetShareMsgText) resetShareMsgText.innerHTML = '';
+                if (resetOwnerBadge) resetOwnerBadge.style.display = 'none';
+                if (shareCountdown) shareCountdown.style.display = 'none';
+                if (shareCreatedDate) shareCreatedDate.textContent = '';
+                currentShareData = null;
                 btnDownloadAll.style.display = 'none';
                 // Get key from hash fragment
                 const keyHex = window.location.hash.substring(1);
@@ -4756,7 +4810,15 @@
         }
 
         // --- FILE PREVIEW DRAWER (DECRYPT ON-THE-FLY) ---
+        let activePreviewAbortController = null;
+
         async function openPreview(file) {
+            if (activePreviewAbortController) {
+                activePreviewAbortController.abort();
+            }
+            const previewAc = new AbortController();
+            activePreviewAbortController = previewAc;
+
             const filename = file.name.split('/').pop();
             const ext = filename.split('.').pop().toLowerCase();
 
@@ -4772,6 +4834,7 @@
 
             const keyHex = window.location.hash.substring(1);
             const key = await importKeyFromHex(keyHex);
+            if (previewAc.signal.aborted) return;
             
             const fileUrl = `/api/share/${currentShareUUID}/file/file_${file.id}.enc`;
 
@@ -4868,6 +4931,7 @@
                     const streamPath = `/preview-stream/${currentShareUUID}/${file.id}`;
                     const contentType = file.type || mimeForExt(ext);
                     await initPreviewStream(streamPath, file, contentType);
+                    if (previewAc.signal.aborted) return;
                     streamUrl = streamPath;
 
                     previewContentBox.innerHTML = '';
@@ -4931,11 +4995,14 @@
 
             try {
                 // Fetch + decrypt (chunked-aware) for in-browser preview
-                const decBuf = await decryptFileToArrayBuffer(fileUrl, key, file, onPreviewProgress);
+                const decBuf = await decryptFileToArrayBuffer(fileUrl, key, file, onPreviewProgress, previewAc.signal);
+                if (previewAc.signal.aborted) return;
                 const decBytes = new Uint8Array(decBuf);
 
-                const blob = new Blob([decBytes], { type: file.type });
-                const localUrl = URL.createObjectURL(blob);
+                const needsBlobUrl = isImage || isVideo || isAudio;
+                const localUrl = needsBlobUrl
+                    ? URL.createObjectURL(new Blob([decBytes], { type: file.type }))
+                    : null;
 
                 previewContentBox.innerHTML = '';
                 btnPreviewDownload.style.opacity = '1';
@@ -4948,6 +5015,7 @@
                     img.alt = filename;
                     // Revoke local blob URL after image loading to save client memory
                     img.onload = () => URL.revokeObjectURL(localUrl);
+                    img.onerror = () => URL.revokeObjectURL(localUrl);
                     previewContentBox.appendChild(img);
                 } 
                 else if (isVideo) {
@@ -5003,6 +5071,7 @@
                     previewContentBox.appendChild(fallback);
                 }
             } catch (err) {
+                if (previewAc.signal.aborted || (err && err.name === 'AbortError')) return;
                 previewContentBox.innerHTML = `
                     <div style="color:var(--danger); text-align:center;">
                         <svg viewBox="0 0 24 24" style="width:3rem;height:3rem;fill:currentColor;margin-bottom:1rem;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v5z"/></svg>
@@ -5013,19 +5082,24 @@
             }
         }
 
+        function revokeMediaBlobSrc(el) {
+            if (!el) return;
+            try { if (typeof el.pause === 'function') el.pause(); } catch (_) {}
+            const src = el.getAttribute('src') || el.src || '';
+            if (src.startsWith('blob:')) {
+                try { URL.revokeObjectURL(src); } catch (_) {}
+            }
+        }
+
         function closePreview() {
+            if (activePreviewAbortController) {
+                activePreviewAbortController.abort();
+                activePreviewAbortController = null;
+            }
             closeAppModal(previewModal, () => {
-                const video = previewContentBox.querySelector('video');
-                if (video) {
-                    video.pause();
-                    URL.revokeObjectURL(video.src);
-                }
-                const audio = previewContentBox.querySelector('audio');
-                if (audio) {
-                    audio.pause();
-                    URL.revokeObjectURL(audio.src);
-                }
-                
+                revokeMediaBlobSrc(previewContentBox.querySelector('video'));
+                revokeMediaBlobSrc(previewContentBox.querySelector('audio'));
+                revokeMediaBlobSrc(previewContentBox.querySelector('img'));
                 previewContentBox.innerHTML = '';
             });
         }
@@ -5060,6 +5134,8 @@
             const zipFileName = `dill-share-${currentShareUUID}.zip`;
             showToast(`Preparing download of ${totalFiles} file(s)...`, 'info');
 
+            let sink = null;
+            let sinkAborted = false;
             try {
                 // Precompute total plaintext size for an accurate overall percent.
                 let totalPlainSize = 0;
@@ -5078,7 +5154,7 @@
                 // --- Acquire a streaming disk sink for the ZIP output. ---
                 // Omit Content-Length: the dynamic ZIP stream size includes headers and compression,
                 // so totalPlainSize would trigger net::ERR_CONTENT_LENGTH_MISMATCH.
-                let sink = await createSWWriteStream(zipFileName, undefined, 'application/zip');
+                sink = await createSWWriteStream(zipFileName, undefined, 'application/zip');
 
                 if (!sink && typeof streamSaver !== 'undefined' && !isSafariOrIOS()) {
                     try {
@@ -5167,6 +5243,27 @@
                 // Process each file in order: take it from the prepared buffer
                 // if small, or stream it inline if large. ZIP entries are
                 // written strictly in share order regardless.
+                const usedZipPaths = new Set();
+                function uniqueZipEntryName(rawName) {
+                    let candidate = rawName;
+                    if (!usedZipPaths.has(candidate)) {
+                        usedZipPaths.add(candidate);
+                        return candidate;
+                    }
+                    const slashIdx = rawName.lastIndexOf('/');
+                    const dir = slashIdx >= 0 ? rawName.slice(0, slashIdx + 1) : '';
+                    const base = slashIdx >= 0 ? rawName.slice(slashIdx + 1) : rawName;
+                    const dotIdx = base.lastIndexOf('.');
+                    const stem = dotIdx > 0 ? base.slice(0, dotIdx) : base;
+                    const ext = dotIdx > 0 ? base.slice(dotIdx) : '';
+                    let suffix = 2;
+                    while (usedZipPaths.has(candidate)) {
+                        candidate = `${dir}${stem} (${suffix++})${ext}`;
+                    }
+                    usedZipPaths.add(candidate);
+                    return candidate;
+                }
+
                 for (let i = 0; i < totalFiles; i++) {
                     maintainPrepareWindow(i + 1);
 
@@ -5176,7 +5273,7 @@
                     renderOverall(i, totalPlainSize > 0 ? Math.min(100, Math.round((processedPlainSize / totalPlainSize) * 100)) : 0);
 
                     // Create a pass-through (STORE, no re-compression) ZIP entry.
-                    const entry = new fflate.ZipPassThrough(file.name);
+                    const entry = new fflate.ZipPassThrough(uniqueZipEntryName(file.name));
                     zip.add(entry);
 
                     const isChunked = file && file.chunked === true;
@@ -5219,7 +5316,10 @@
                         }
                         prepared.clear();
                         fileAc.abort();
-                        if (sink) { try { await sink.abort(); } catch (_) {} }
+                        if (sink && !sinkAborted) {
+                            sinkAborted = true;
+                            try { await sink.abort(); } catch (_) {}
+                        }
                         throw e;
                     }
 
@@ -5256,6 +5356,10 @@
                 showToast('Download finished!', 'success');
 
             } catch (err) {
+                if (sink && !sinkAborted) {
+                    sinkAborted = true;
+                    try { await sink.abort(); } catch (_) {}
+                }
                 showToast('Download all failed: ' + err.message, 'error');
             } finally {
                 // Restore button state
@@ -5851,7 +5955,7 @@
             updateHeaderAuthState();
 
             const activeTab = document.querySelector('.tab-content.active');
-            if (activeTab.id === 'view-shares') {
+            if (activeTab && activeTab.id === 'view-shares') {
                 loadSharesList();
             }
         }
@@ -6003,6 +6107,11 @@
             const reader = new FileReader();
             reader.onload = async () => {
                 const base64DataUrl = reader.result;
+                if (typeof base64DataUrl !== 'string' || !/^data:image\/(?:png|jpeg|webp);base64,/i.test(base64DataUrl)) {
+                    showToast('Please select a PNG, JPEG, or WebP image.', 'error');
+                    settingsPfpInput.value = '';
+                    return;
+                }
                 const token = localStorage.getItem('dill_session_token');
                 
                 try {
@@ -6080,7 +6189,22 @@
                 const encBuf = await encryptData(rawData.buffer, newKey);
                 const encHex = bufToHex(encBuf);
 
-                const currentPfp = localStorage.getItem('dill_pfp');
+                let currentPfp = localStorage.getItem('dill_pfp');
+                if (!currentPfp) {
+                    try {
+                        const profRes = await fetch('/api/user/profile', {
+                            headers: { 'Authorization': `Bearer ${token}` }
+                        });
+                        if (profRes.ok) {
+                            const prof = await profRes.json();
+                            const pfpEncHex = prof.pfp_enc || prof.pfp;
+                            if (pfpEncHex) {
+                                currentPfp = await decryptPfp(pfpEncHex, currentKeys.encKeyBuf);
+                                if (currentPfp) localStorage.setItem('dill_pfp', currentPfp);
+                            }
+                        }
+                    } catch (_) {}
+                }
                 let newPfpEnc = null;
                 if (currentPfp) {
                     newPfpEnc = await encryptPfp(currentPfp, newKeys.encKeyBuf);
@@ -6153,6 +6277,7 @@
                 });
 
                 if (res.ok) {
+                    localStorage.removeItem('dill_enc_key_' + username);
                     showToast('Your account and all shares have been permanently deleted.', 'success');
                     await logoutUser();
                 } else {
@@ -6872,169 +6997,6 @@
                 dashboard.style.display = 'block';
                 showToast(err.message, 'error');
                 usersBody.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--danger); padding:2rem;">Error: ${escapeHtml(err.message)}</td></tr>`;
-            }
-        }
-
-        async function loadAdminSessions() {
-            const token = localStorage.getItem('dill_session_token');
-            const adminSessionsBody = document.getElementById('admin-sessions-list-body');
-            if (!token) return;
-
-            adminSessionsBody.innerHTML = `
-                <tr>
-                    <td colspan="5" style="text-align:center; padding: 2rem 0;">
-                        <div class="loader" style="margin:1rem auto;"></div>
-                        <span style="font-size:0.85rem; color:var(--text-muted);">Loading admin sessions...</span>
-                    </td>
-                </tr>
-            `;
-
-            try {
-                const res = await fetch('/api/admin/sessions', {
-                    headers: { 'Authorization': `Bearer ${token}` }
-                });
-
-                if (!res.ok) {
-                    throw new Error(await res.text());
-                }
-
-                const sessions = await res.json();
-                adminSessionsBody.innerHTML = '';
-
-                if (sessions.length === 0) {
-                    adminSessionsBody.innerHTML = `
-                        <tr>
-                            <td colspan="5" style="text-align:center; color:var(--text-muted); padding:2rem 0;">
-                                No active admin sessions found.
-                            </td>
-                        </tr>
-                    `;
-                    return;
-                }
-
-                // Sort: current session first, then by created_at desc
-                sessions.sort((a, b) => {
-                    if (a.is_current && !b.is_current) return -1;
-                    if (!a.is_current && b.is_current) return 1;
-                    return b.created_at - a.created_at;
-                });
-
-                sessions.forEach(session => {
-                    const row = document.createElement('tr');
-                    
-                    const deviceName = parseUserAgent(session.user_agent);
-                    const ipStr = session.ip;
-                    
-                    const createdDate = new Date(session.created_at * 1000).toLocaleString();
-                    
-                    const currentBadge = session.is_current 
-                        ? `<span class="badge success" style="margin-left:0.5rem; font-size:0.7rem; font-family:sans-serif; text-transform:uppercase;">Current</span>` 
-                        : '';
-                    
-                    const buttonClass = session.is_current ? 'btn btn-secondary' : 'btn btn-danger';
-                    
-                    const titleHtml = session.name 
-                        ? `<span style="font-weight:600; display:flex; align-items:center; color:var(--primary);">${escapeHtml(session.name)} ${currentBadge}</span>
-                           <span style="font-size:0.75rem; color:var(--text-main); margin-top:0.1rem;">${deviceName}</span>`
-                        : `<span style="font-weight:500; display:flex; align-items:center;">${deviceName} ${currentBadge}</span>`;
-
-                    row.innerHTML = `
-                        <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border);">
-                            <div style="display:flex; flex-direction:column;">
-                                ${titleHtml}
-                                <span style="font-size:0.75rem; color:var(--text-muted); font-family:monospace; margin-top:0.2rem; word-break:break-all;">
-                                    ${escapeHtml(session.user_agent)}
-                                </span>
-                            </div>
-                        </td>
-                        <td style="padding: 1rem 0.85rem; font-family:monospace; border-bottom: 1px solid var(--surface-border);">${escapeHtml(ipStr)}</td>
-                        <td style="padding: 1rem 0.85rem; border-bottom: 1px solid var(--surface-border); font-size:0.8rem;">${createdDate}</td>
-                        <td style="padding: 1rem 0.85rem; text-align:right; border-bottom: 1px solid var(--surface-border);">
-                            <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
-                                <button class="btn btn-secondary btn-rename-admin-session" data-id="${escapeHtml(session.id)}" data-name="${escapeHtml(session.name || '')}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
-                                    Rename
-                                </button>
-                                <button class="${buttonClass} btn-revoke-admin-session" data-id="${escapeHtml(session.id)}" data-current="${session.is_current}" style="padding: 0.3rem 0.6rem; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
-                                    Revoke
-                                </button>
-                            </div>
-                        </td>
-                    `;
-                    adminSessionsBody.appendChild(row);
-
-                    const renameBtn = row.querySelector('.btn-rename-admin-session');
-                    if (renameBtn) {
-                        renameBtn.addEventListener('click', async (e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            const currentName = session.name || '';
-                            const newName = await customPrompt('Enter a custom name for this admin session:', 'Rename Admin Session', currentName);
-                            if (newName !== null) {
-                                try {
-                                    const renRes = await fetch(`/api/admin/sessions/${session.id}`, {
-                                        method: 'PUT',
-                                        headers: { 
-                                            'Authorization': `Bearer ${token}`,
-                                            'Content-Type': 'application/json'
-                                        },
-                                        body: JSON.stringify({ name: newName })
-                                    });
-                                    if (renRes.ok) {
-                                        showToast('Admin session renamed successfully', 'success');
-                                        loadAdminSessions();
-                                    } else {
-                                        showToast('Failed to rename admin session: ' + await renRes.text(), 'error');
-                                    }
-                                } catch (err) {
-                                    showToast('Network error while renaming admin session', 'error');
-                                }
-                            }
-                        });
-                    }
-
-                    const revokeBtn = row.querySelector('.btn-revoke-admin-session');
-                    if (revokeBtn) {
-                        revokeBtn.addEventListener('click', async (e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            const isCurrent = session.is_current;
-                            const confirmMsg = isCurrent 
-                                ? 'Are you sure you want to log out of your current admin session?'
-                                : 'Are you sure you want to revoke this admin session? That browser will be logged out immediately.';
-                                
-                            if (await customConfirm(confirmMsg, isCurrent ? 'Log Out' : 'Revoke Admin Session', isCurrent ? 'Log Out' : 'Revoke', true)) {
-                                try {
-                                    const revRes = await fetch(`/api/admin/sessions/${session.id}`, {
-                                        method: 'DELETE',
-                                        headers: { 'Authorization': `Bearer ${token}` }
-                                    });
-                                    
-                                    if (revRes.ok) {
-                                        showToast(isCurrent ? 'Logged out successfully' : 'Admin session revoked successfully', 'success');
-                                        if (isCurrent) {
-                                            await logoutUser();
-                                        } else {
-                                            loadAdminSessions();
-                                        }
-                                    } else {
-                                        showToast('Failed to revoke admin session: ' + await revRes.text(), 'error');
-                                    }
-                                } catch (err) {
-                                    showToast('Network error while revoking admin session', 'error');
-                                }
-                            }
-                        });
-                    }
-                });
-
-            } catch (err) {
-                adminSessionsBody.innerHTML = `
-                    <tr>
-                        <td colspan="5" style="text-align:center; color:var(--danger); padding:2rem 0;">
-                            Failed to load admin sessions: ${escapeHtml(err.message)}
-                        </td>
-                    </tr>
-                `;
             }
         }
 

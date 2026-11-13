@@ -93,18 +93,38 @@ async function importKeyFromRaw(rawBuf) {
     return crypto.subtle.importKey('raw', rawBuf, { name: 'AES-GCM' }, false, ['decrypt']);
 }
 
+function sanitizeDownloadContentType(raw) {
+    if (typeof raw !== 'string') return 'application/octet-stream';
+    const base = raw.split(';')[0].trim().toLowerCase();
+    if (!/^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}$/.test(base)) {
+        return 'application/octet-stream';
+    }
+    return base;
+}
+
+function sanitizePreviewContentType(raw) {
+    const base = sanitizeDownloadContentType(raw);
+    if (!/^(?:video|audio)\/[a-z0-9][a-z0-9.+-]*$/.test(base)) {
+        return 'application/octet-stream';
+    }
+    const subtype = base.split('/')[1];
+    if (subtype.includes('html') || subtype.includes('xml') || subtype.includes('svg')) {
+        return 'application/octet-stream';
+    }
+    return base;
+}
+
 self.addEventListener('message', async (event) => {
     const d = event.data;
     if (!d) return;
+
     if (d.type === 'DILL_DOWNLOAD_INIT') {
         const port = event.ports && event.ports[0];
         if (!port) return;
         const streamPath = d.streamPath;
         const filename = typeof d.filename === 'string' && d.filename ? d.filename.slice(0, 1024) : 'download';
         const size = d.size;
-        const contentType = typeof d.contentType === 'string' && d.contentType.length <= 255
-            ? d.contentType
-            : 'application/octet-stream';
+        const contentType = sanitizeDownloadContentType(d.contentType);
         if (typeof streamPath !== 'string' || !streamPath.startsWith(DOWNLOAD_PREFIX) ||
             (size !== undefined && (!Number.isSafeInteger(size) || size < 0))) {
             port.postMessage('cancel');
@@ -155,6 +175,7 @@ self.addEventListener('message', async (event) => {
                     throw new Error('Invalid preview authorization URL');
                 }
             }
+            files.delete(d.streamPath);
             if (files.size >= 5) {
                 const firstKey = files.keys().next().value;
                 files.delete(firstKey);
@@ -165,7 +186,7 @@ self.addEventListener('message', async (event) => {
                 size: d.size,
                 chunked: !!d.chunked,
                 ctSize: d.chunked ? ctSizeFor(d.size, true) : null,
-                contentType: d.contentType || 'application/octet-stream',
+                contentType: sanitizePreviewContentType(d.contentType),
                 url: d.url,
                 authUrl: d.authUrl || null,
                 urlRefresh: null,
@@ -239,7 +260,9 @@ function handleDownloadStream(streamPath) {
     const headers = new Headers({
         'Content-Type': entry.contentType || 'application/octet-stream',
         'Content-Disposition': `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodedFilename}`,
-        'Cache-Control': 'no-cache, no-store'
+        'Cache-Control': 'no-cache, no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': "default-src 'none'; sandbox",
     });
     if (Number.isSafeInteger(entry.size) && entry.size >= 0) {
         headers.set('Content-Length', String(entry.size));
@@ -266,14 +289,15 @@ async function handleStream(request, streamPath) {
         return new Response('Method not allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });
     }
 
-    const rangeHeader = request.headers.get('Range');
+    const rawRange = request.headers.get('Range');
+    const rangeHeader = rawRange ? rawRange.trim() : '';
     let start = 0;
     let end = total; // exclusive
     let isRange = false;
     let invalidRange = false;
     if (rangeHeader) {
         isRange = true;
-        if (!rangeHeader.startsWith('bytes=') || rangeHeader.includes(',')) {
+        if (!/^bytes=/i.test(rangeHeader) || rangeHeader.includes(',')) {
             invalidRange = true;
         } else {
             const spec = rangeHeader.slice(6).trim();
@@ -324,6 +348,8 @@ function headHeaders(meta, total) {
         'Accept-Ranges': 'bytes',
         'Content-Length': String(total),
         'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': "default-src 'none'; media-src 'self'; sandbox",
     };
     return h;
 }
@@ -418,12 +444,7 @@ async function respondChunkedRange(meta, start, end, isRange) {
     const ranges = plainRangeToCtRanges(start, end, meta.size);
     const totalLength = end - start;
     const status = isRange ? 206 : 200;
-    const headers = {
-        'Content-Type': meta.contentType,
-        'Accept-Ranges': 'bytes',
-        'Content-Length': String(totalLength),
-        'Cache-Control': 'no-store',
-    };
+    const headers = headHeaders(meta, totalLength);
     if (isRange) {
         headers['Content-Range'] = `bytes ${start}-${end - 1}/${meta.size}`;
     }
@@ -494,27 +515,30 @@ async function respondChunkedRange(meta, start, end, isRange) {
 async function respondLegacyRange(meta, start, end, isRange, total) {
     // Legacy single-block format: must decrypt the whole file once, then slice.
     if (!meta.cached) {
-        let res = await fetch(meta.url);
-        if ((res.status === 401 || res.status === 403) && meta.authUrl) {
-            await refreshUpstreamUrl(meta);
-            res = await fetch(meta.url);
+        if (!meta.legacyPromise) {
+            meta.legacyPromise = (async () => {
+                let res = await fetch(meta.url);
+                if ((res.status === 401 || res.status === 403) && meta.authUrl) {
+                    await refreshUpstreamUrl(meta);
+                    res = await fetch(meta.url);
+                }
+                if (!res.ok) throw new Error('Upstream fetch failed: ' + res.status);
+                const ab = await res.arrayBuffer();
+                const data = new Uint8Array(ab);
+                const iv = data.subarray(0, 12);
+                const ct = data.subarray(12);
+                meta.cached = await decryptChunk(iv, ct, meta.key);
+                return meta.cached;
+            })().catch((err) => {
+                meta.legacyPromise = null;
+                throw err;
+            });
         }
-        if (!res.ok) throw new Error('Upstream fetch failed: ' + res.status);
-        const ab = await res.arrayBuffer();
-        const data = new Uint8Array(ab);
-        const iv = data.subarray(0, 12);
-        const ct = data.subarray(12);
-        const pt = await decryptChunk(iv, ct, meta.key);
-        meta.cached = pt;
+        await meta.legacyPromise;
     }
     const slice = meta.cached.subarray(start, end);
     const status = isRange ? 206 : 200;
-    const headers = {
-        'Content-Type': meta.contentType,
-        'Accept-Ranges': 'bytes',
-        'Content-Length': String(slice.length),
-        'Cache-Control': 'no-store',
-    };
+    const headers = headHeaders(meta, slice.length);
     if (isRange) {
         headers['Content-Range'] = `bytes ${start}-${start + slice.length - 1}/${total}`;
     }

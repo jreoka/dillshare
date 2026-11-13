@@ -25,16 +25,6 @@ impl StorageCipher {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn from_slice(key_bytes: &[u8]) -> Result<Self, String> {
-        if key_bytes.len() != 32 {
-            return Err("Storage encryption key must be exactly 32 bytes".to_string());
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(key_bytes);
-        Ok(Self::new(&key))
-    }
-
     /// Derive a 32-byte key from secret bytes using HMAC-SHA256
     pub fn derive_from_secret(secret: &[u8]) -> Self {
         type HmacSha256 = Hmac<Sha256>;
@@ -120,26 +110,13 @@ impl Storage {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn with_cipher(mut self, cipher: StorageCipher) -> Self {
-        self.cipher = Some(Arc::new(cipher));
-        self
-    }
-
     pub fn set_cipher(&mut self, cipher: StorageCipher) {
         self.cipher = Some(Arc::new(cipher));
     }
 
-    #[allow(dead_code)]
-    pub fn with_sse(mut self, sse_algorithm: Option<String>, sse_kms_key_id: Option<String>) -> Self {
-        self.sse_algorithm = sse_algorithm;
-        self.sse_kms_key_id = sse_kms_key_id;
-        self
-    }
-
     pub fn set_sse(&mut self, sse_algorithm: Option<String>, sse_kms_key_id: Option<String>) {
-        self.sse_algorithm = sse_algorithm;
-        self.sse_kms_key_id = sse_kms_key_id;
+        self.sse_algorithm = sse_algorithm.filter(|s| !s.trim().is_empty());
+        self.sse_kms_key_id = sse_kms_key_id.filter(|s| !s.trim().is_empty());
     }
 }
 
@@ -234,6 +211,33 @@ impl Storage {
         }
     }
 
+    fn resolved_sse(&self) -> Option<(aws_sdk_s3::types::ServerSideEncryption, Option<&str>)> {
+        let algo = self.sse_algorithm.as_deref()?;
+        if algo.eq_ignore_ascii_case("AES256") {
+            Some((aws_sdk_s3::types::ServerSideEncryption::Aes256, None))
+        } else if algo.eq_ignore_ascii_case("aws:kms") {
+            Some((
+                aws_sdk_s3::types::ServerSideEncryption::AwsKms,
+                self.sse_kms_key_id.as_deref(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn apply_put_sse(
+        &self,
+        mut req: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+    ) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
+        if let Some((algo, kms_id)) = self.resolved_sse() {
+            req = req.server_side_encryption(algo);
+            if let Some(kms_id) = kms_id {
+                req = req.ssekms_key_id(kms_id);
+            }
+        }
+        req
+    }
+
     pub async fn presign_put_object(
         &self,
         bucket: &str,
@@ -247,25 +251,16 @@ impl Storage {
         };
         let config = aws_sdk_s3::presigning::PresigningConfig::expires_in(expires_in)
             .map_err(|e| e.to_string())?;
-        let mut builder = client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .content_length(content_length)
-            .content_type("application/octet-stream")
-            .checksum_sha256(checksum_sha256)
-            .if_none_match("*");
-
-        if let Some(ref sse) = self.sse_algorithm {
-            if sse.eq_ignore_ascii_case("AES256") {
-                builder = builder.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256);
-            } else if sse.eq_ignore_ascii_case("aws:kms") {
-                builder = builder.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms);
-                if let Some(ref kms_id) = self.sse_kms_key_id {
-                    builder = builder.ssekms_key_id(kms_id);
-                }
-            }
-        }
+        let builder = self.apply_put_sse(
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .content_length(content_length)
+                .content_type("application/octet-stream")
+                .checksum_sha256(checksum_sha256)
+                .if_none_match("*"),
+        );
 
         let request = builder
             .presigned(config)
@@ -491,16 +486,7 @@ impl Storage {
                 if let Some(ct) = content_type {
                     req = req.content_type(ct);
                 }
-                if let Some(ref sse) = self.sse_algorithm {
-                    if sse.eq_ignore_ascii_case("AES256") {
-                        req = req.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256);
-                    } else if sse.eq_ignore_ascii_case("aws:kms") {
-                        req = req.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms);
-                        if let Some(ref kms_id) = self.sse_kms_key_id {
-                            req = req.ssekms_key_id(kms_id);
-                        }
-                    }
-                }
+                req = self.apply_put_sse(req);
                 req.send().await.map_err(|e| e.to_string())?;
                 Ok(())
             }
@@ -582,16 +568,7 @@ impl Storage {
                 if let Some(content_type) = content_type {
                     request = request.content_type(content_type);
                 }
-                if let Some(ref sse) = self.sse_algorithm {
-                    if sse.eq_ignore_ascii_case("AES256") {
-                        request = request.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256);
-                    } else if sse.eq_ignore_ascii_case("aws:kms") {
-                        request = request.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms);
-                        if let Some(ref kms_id) = self.sse_kms_key_id {
-                            request = request.ssekms_key_id(kms_id);
-                        }
-                    }
-                }
+                request = self.apply_put_sse(request);
                 match request.send().await {
                     Ok(_) => Ok(true),
                     Err(error) => {
@@ -656,16 +633,7 @@ impl Storage {
                 if let Some(content_type) = content_type {
                     request = request.content_type(content_type);
                 }
-                if let Some(ref sse) = self.sse_algorithm {
-                    if sse.eq_ignore_ascii_case("AES256") {
-                        request = request.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256);
-                    } else if sse.eq_ignore_ascii_case("aws:kms") {
-                        request = request.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms);
-                        if let Some(ref kms_id) = self.sse_kms_key_id {
-                            request = request.ssekms_key_id(kms_id);
-                        }
-                    }
-                }
+                request = self.apply_put_sse(request);
                 match request.send().await {
                     Ok(_) => Ok(true),
                     Err(error) => {
@@ -857,14 +825,10 @@ impl Storage {
                 if let Some(ct) = content_type {
                     req = req.content_type(ct);
                 }
-                if let Some(ref sse) = self.sse_algorithm {
-                    if sse.eq_ignore_ascii_case("AES256") {
-                        req = req.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256);
-                    } else if sse.eq_ignore_ascii_case("aws:kms") {
-                        req = req.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms);
-                        if let Some(ref kms_id) = self.sse_kms_key_id {
-                            req = req.ssekms_key_id(kms_id);
-                        }
+                if let Some((algo, kms_id)) = self.resolved_sse() {
+                    req = req.server_side_encryption(algo);
+                    if let Some(kms_id) = kms_id {
+                        req = req.ssekms_key_id(kms_id);
                     }
                 }
                 let res = req.send().await.map_err(|e| e.to_string())?;
@@ -920,6 +884,14 @@ impl Storage {
             }
             StorageBackend::Memory(mem) => {
                 let mut m = mem.lock().await;
+                match m.multipart_upload_keys.get(upload_id) {
+                    Some(expected_key) if expected_key == key => {}
+                    Some(_) => return Err("Upload ID does not match target key".to_string()),
+                    None => return Err("Upload ID not found".to_string()),
+                }
+                if m.files.contains_key(key) {
+                    return Err("Target object already exists".to_string());
+                }
                 m.multipart_upload_keys.remove(upload_id);
                 if let Some(upload) = m.multipart_uploads.remove(upload_id) {
                     let mut data = Vec::new();
